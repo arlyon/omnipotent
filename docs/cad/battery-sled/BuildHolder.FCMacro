@@ -1,0 +1,5 @@
+"""Open in FreeCAD's Macro menu and execute to regenerate this prototype."""
+import runpy
+from pathlib import Path
+
+runpy.run_path(str(Path(__file__).resolve().parent / "build_holder.py"), run_name="__main__")

@@ -1,0 +1,671 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::vector_ops::DistanceMetric;
+
+// ---------------------------------------------------------------------------
+// Deterministic PRNG -- no_std compatible
+// ---------------------------------------------------------------------------
+
+/// Xorshift64 PRNG. Deterministic, fast, `no_std`.
+/// Quality is sufficient for k-means++ initialisation.
+pub(crate) struct Xorshift64(u64);
+
+impl Xorshift64 {
+    pub fn new(seed: u64) -> Self {
+        // Ensure non-zero state.
+        Self(if seed == 0 {
+            0x5EED_DEAD_BEEF_CAFE
+        } else {
+            seed
+        })
+    }
+
+    /// Seed from a slice of f32 data (hashes the bytes via a simple mix).
+    pub fn from_data(data: &[f32]) -> Self {
+        let mut h: u64 = 0x517c_c1b7_2722_0a95;
+        for &x in data {
+            let bits = u64::from(x.to_bits());
+            h ^= bits;
+            h = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            h ^= h >> 30;
+        }
+        Self::new(h)
+    }
+
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// Returns a value in [0.0, 1.0).
+    #[inline]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+
+    /// Returns a random index in [0, n).
+    ///
+    /// Uses Lemire's nearly divisionless method to eliminate modulo bias.
+    /// Returns 0 if `n == 0`.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn next_usize(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        // Lemire's fast unbiased bounded random: avoids modulo bias for all n.
+        let n = n as u64;
+        let mut x = self.next_u64();
+        let mut hi = ((u128::from(x) * u128::from(n)) >> 64) as u64;
+        let mut lo = x.wrapping_mul(n);
+        if lo < n {
+            let threshold = n.wrapping_neg() % n; // (2^64 - n) % n
+            while lo < threshold {
+                x = self.next_u64();
+                let full = u128::from(x) * u128::from(n);
+                hi = (full >> 64) as u64;
+                lo = full as u64;
+            }
+        }
+        hi as usize
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k-means++ initialisation
+// ---------------------------------------------------------------------------
+
+/// Select `k` initial centroids from `vectors` using k-means++ seeding.
+///
+/// Each vector is `dim` contiguous f32 values. The total number of vectors is
+/// `vectors.len() / dim`.
+fn kmeans_pp_init(
+    flat_vectors: &[f32],
+    dim: usize,
+    k: usize,
+    rng: &mut Xorshift64,
+    metric: DistanceMetric,
+) -> Vec<f32> {
+    assert!(dim > 0, "kmeans: dimension must be positive");
+    let n = flat_vectors.len() / dim;
+    debug_assert!(k > 0 && k <= n);
+
+    // Output: k centroids x dim floats, stored flat.
+    let mut centroids = Vec::with_capacity(k * dim);
+
+    // Pick the first centroid uniformly at random.
+    let first = rng.next_usize(n);
+    centroids.extend_from_slice(&flat_vectors[first * dim..(first + 1) * dim]);
+
+    // Distance from each vector to its nearest already-chosen centroid.
+    let mut min_dists = vec![f32::INFINITY; n];
+
+    for c in 1..k {
+        // Update min_dists with the most recently added centroid.
+        let prev_start = (c - 1) * dim;
+        let prev_centroid = &centroids[prev_start..prev_start + dim];
+        let mut total: f64 = 0.0;
+        for i in 0..n {
+            let v = &flat_vectors[i * dim..(i + 1) * dim];
+            let d = metric.compute(v, prev_centroid);
+            if d < min_dists[i] {
+                min_dists[i] = d;
+            }
+            total += f64::from(min_dists[i]);
+        }
+
+        // Weighted random selection proportional to min_dists.
+        if total <= 0.0 {
+            // Degenerate: all remaining points coincide with existing centroids.
+            // Pick any unassigned point.
+            centroids.extend_from_slice(&flat_vectors[rng.next_usize(n) * dim..][..dim]);
+            continue;
+        }
+
+        let threshold = rng.next_f64() * total;
+        let mut cumulative: f64 = 0.0;
+        let mut chosen = n - 1;
+        for (i, dist) in min_dists.iter().enumerate().take(n) {
+            cumulative += f64::from(*dist);
+            if cumulative >= threshold {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.extend_from_slice(&flat_vectors[chosen * dim..(chosen + 1) * dim]);
+    }
+
+    centroids
+}
+
+// ---------------------------------------------------------------------------
+// Lloyd's k-means iteration
+// ---------------------------------------------------------------------------
+
+/// Assign each vector to its nearest centroid.
+///
+/// Returns a vector of length `n` with cluster indices, and the total
+/// intra-cluster distance (for convergence checking).
+fn assign_all(
+    flat_vectors: &[f32],
+    dim: usize,
+    centroids: &[f32],
+    k: usize,
+    assignments: &mut Vec<u32>,
+    metric: DistanceMetric,
+) -> f64 {
+    let n = flat_vectors.len() / dim;
+    assignments.clear();
+    assignments.reserve(n);
+
+    let mut total_dist: f64 = 0.0;
+
+    for i in 0..n {
+        let v = &flat_vectors[i * dim..(i + 1) * dim];
+        let mut best_c = 0u32;
+        let mut best_d = f32::INFINITY;
+        for c in 0..k {
+            let centroid = &centroids[c * dim..(c + 1) * dim];
+            let d = metric.compute(v, centroid);
+            if d < best_d {
+                best_d = d;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    best_c = c as u32;
+                }
+            }
+        }
+        assignments.push(best_c);
+        total_dist += f64::from(best_d);
+    }
+
+    total_dist
+}
+
+/// Recompute centroids as the mean of assigned vectors.
+///
+/// Uses f64 accumulators to avoid float overflow when summing many large-valued
+/// vectors in a single cluster (BUG 8 fix).
+fn recompute_centroids(
+    flat_vectors: &[f32],
+    dim: usize,
+    k: usize,
+    assignments: &[u32],
+    centroids: &mut [f32],
+) {
+    let n = flat_vectors.len() / dim;
+
+    // Accumulate in f64 to prevent overflow with large clusters / extreme values.
+    let mut accum = vec![0.0f64; k * dim];
+    let mut counts = vec![0u64; k];
+
+    for i in 0..n {
+        let c = assignments[i] as usize;
+        counts[c] += 1;
+        let v = &flat_vectors[i * dim..(i + 1) * dim];
+        let dest = &mut accum[c * dim..(c + 1) * dim];
+        for (d, &s) in dest.iter_mut().zip(v.iter()) {
+            *d += f64::from(s);
+        }
+    }
+
+    // Divide by count and convert back to f32.
+    for c in 0..k {
+        if counts[c] > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let scale = 1.0 / counts[c] as f64;
+            let src = &accum[c * dim..(c + 1) * dim];
+            let dest = &mut centroids[c * dim..(c + 1) * dim];
+            #[allow(clippy::cast_possible_truncation)]
+            for (d, &s) in dest.iter_mut().zip(src.iter()) {
+                *d = (s * scale) as f32;
+            }
+        } else {
+            // Zero out centroids for empty clusters (will be restored from
+            // old_centroids by the caller).
+            centroids[c * dim..(c + 1) * dim].fill(0.0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Run k-means clustering on flat vectors and return `k` centroids.
+///
+/// `flat_vectors` contains `n` vectors of dimension `dim`, stored contiguously.
+/// Uses k-means++ initialisation and Lloyd's algorithm.
+///
+/// Returns a flat `Vec<f32>` of length `k * dim`.
+pub fn kmeans(
+    flat_vectors: &[f32],
+    dim: usize,
+    k: usize,
+    max_iter: usize,
+    metric: DistanceMetric,
+) -> Vec<f32> {
+    let n = flat_vectors.len() / dim.max(1);
+    if n == 0 || dim == 0 {
+        return Vec::new();
+    }
+
+    // Clamp k to available points.
+    let k = k.min(n);
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let mut rng = Xorshift64::from_data(&flat_vectors[..dim.min(flat_vectors.len())]);
+    let mut centroids = kmeans_pp_init(flat_vectors, dim, k, &mut rng, metric);
+
+    let mut assignments = Vec::with_capacity(n);
+    let mut prev_dist = f64::INFINITY;
+    let mut old_centroids = vec![0.0f32; k * dim];
+    let mut counts = vec![0u32; k];
+
+    for iter in 0..max_iter {
+        let total_dist = assign_all(flat_vectors, dim, &centroids, k, &mut assignments, metric);
+
+        // Convergence: less than 0.1% relative improvement.
+        let improvement = (prev_dist - total_dist) / prev_dist.max(1e-12);
+        if improvement < 0.001 && iter > 0 {
+            break;
+        }
+        prev_dist = total_dist;
+
+        // Save current centroids for empty-cluster fallback.
+        old_centroids.copy_from_slice(&centroids);
+        recompute_centroids(flat_vectors, dim, k, &assignments, &mut centroids);
+
+        // Restore centroids for any cluster that ended up empty.
+        counts.fill(0);
+        for &a in &assignments {
+            counts[a as usize] += 1;
+        }
+        for c in 0..k {
+            if counts[c] == 0 {
+                centroids[c * dim..(c + 1) * dim]
+                    .copy_from_slice(&old_centroids[c * dim..(c + 1) * dim]);
+            }
+        }
+    }
+
+    centroids
+}
+
+/// Assign a single vector to its nearest centroid.
+///
+/// Returns `(cluster_index, distance)`.
+pub fn assign_nearest(
+    vector: &[f32],
+    centroids: &[f32],
+    dim: usize,
+    num_clusters: usize,
+    metric: DistanceMetric,
+) -> (u32, f32) {
+    let mut best_c = 0u32;
+    let mut best_d = f32::INFINITY;
+    let mut examined = false;
+    for c in 0..num_clusters {
+        let start = c * dim;
+        let end = start + dim;
+        if end > centroids.len() {
+            break;
+        }
+        examined = true;
+        let centroid = &centroids[start..end];
+        let d = metric.compute(vector, centroid);
+        if d < best_d {
+            best_d = d;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                best_c = c as u32;
+            }
+        }
+    }
+    // `best_d` is still the `INFINITY` seed when no centroid was examined --
+    // `num_clusters` is zero, or `centroids` is too short to hold even the
+    // first one. Returning that propagates a non-finite distance into heap
+    // ordering and cluster-distance arithmetic, so report maximally distant
+    // instead, matching `DistanceMetric::compute`.
+    if !examined {
+        return (best_c, f32::MAX);
+    }
+    (best_c, best_d)
+}
+
+/// Find the `nprobe` nearest clusters to a query vector.
+///
+/// Returns a list of `(cluster_id, distance)` sorted by ascending distance.
+/// When `diversity` is enabled, uses Greedy MMR to balance proximity with
+/// spatial diversity across the selected probe set.
+pub fn nearest_clusters(
+    query: &[f32],
+    centroids: &[f32],
+    dim: usize,
+    num_clusters: usize,
+    nprobe: usize,
+    metric: DistanceMetric,
+    diversity: crate::probe_select::DiversityConfig,
+) -> Vec<(u32, f32)> {
+    if num_clusters == 0 {
+        return Vec::new();
+    }
+    let nprobe = nprobe.min(num_clusters).max(1);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mut dists: Vec<(u32, f32)> = (0..num_clusters)
+        .filter_map(|c| {
+            let start = c * dim;
+            let end = start + dim;
+            if end > centroids.len() {
+                return None;
+            }
+            let centroid = &centroids[start..end];
+            Some((c as u32, metric.compute(query, centroid)))
+        })
+        .collect();
+
+    // All centroids may have been filtered out if centroid data is truncated.
+    if dists.is_empty() {
+        return Vec::new();
+    }
+
+    if !diversity.enabled() {
+        // Fast path: identical to previous behavior
+        let select_idx = (nprobe - 1).min(dists.len() - 1);
+        dists.select_nth_unstable_by(select_idx, |a, b| a.1.total_cmp(&b.1));
+        dists.truncate(nprobe.min(dists.len()));
+        dists.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        return dists;
+    }
+
+    // Diversity path: partial sort top 2*nprobe, build centroid shortlist,
+    // then delegate to the shared MMR selector.
+    let shortlist_size = (nprobe.saturating_mul(2)).min(dists.len());
+    dists.select_nth_unstable_by(shortlist_size - 1, |a, b| a.1.total_cmp(&b.1));
+    dists.truncate(shortlist_size);
+    dists.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+
+    // Build flat centroid array for the shortlist (reindexed from original centroids)
+    let mut shortlist_centroids: Vec<f32> = Vec::with_capacity(shortlist_size * dim);
+    for &(cid, _) in &dists {
+        let start = cid as usize * dim;
+        let end = start + dim;
+        if end > centroids.len() {
+            continue;
+        }
+        shortlist_centroids.extend_from_slice(&centroids[start..end]);
+    }
+
+    crate::probe_select::select_diverse_probes(
+        &dists,
+        &shortlist_centroids,
+        dim,
+        nprobe,
+        diversity,
+        metric,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xorshift_deterministic() {
+        let mut rng1 = Xorshift64::new(42);
+        let mut rng2 = Xorshift64::new(42);
+        for _ in 0..100 {
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
+        }
+    }
+
+    #[test]
+    fn xorshift_f64_range() {
+        let mut rng = Xorshift64::new(12345);
+        for _ in 0..10_000 {
+            let v = rng.next_f64();
+            assert!((0.0..1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn kmeans_basic_2d() {
+        // Two well-separated clusters in 2D.
+        #[rustfmt::skip]
+        let data: Vec<f32> = vec![
+            // Cluster around (0, 0)
+            0.1, 0.1,
+            -0.1, 0.2,
+            0.0, -0.1,
+            0.2, 0.0,
+            // Cluster around (10, 10)
+            10.0, 10.1,
+            9.9, 10.0,
+            10.1, 9.9,
+            10.0, 10.0,
+        ];
+
+        let centroids = kmeans(&data, 2, 2, 25, DistanceMetric::EuclideanSq);
+        assert_eq!(centroids.len(), 4); // 2 centroids x 2 dims
+
+        let c0 = &centroids[0..2];
+        let c1 = &centroids[2..4];
+
+        // One centroid should be near (0,0) and the other near (10,10).
+        let near_origin = |c: &[f32]| c[0].abs() < 1.0 && c[1].abs() < 1.0;
+        let near_ten = |c: &[f32]| (c[0] - 10.0).abs() < 1.0 && (c[1] - 10.0).abs() < 1.0;
+
+        assert!(
+            (near_origin(c0) && near_ten(c1)) || (near_origin(c1) && near_ten(c0)),
+            "centroids did not converge: c0={c0:?}, c1={c1:?}"
+        );
+    }
+
+    #[test]
+    fn assign_nearest_never_returns_a_non_finite_distance() {
+        // Finite inputs whose EuclideanSq overflows f32: 1e20 squared is 1e40,
+        // past f32::MAX (~3.4e38). `fuzz_ivfpq_kmeans` sanitises its inputs to
+        // finite values and still saw `inf` come back, because `compute` only
+        // mapped NaN to f32::MAX and let overflow through.
+        // Every centroid must overflow, or a finite one wins and the bug hides:
+        // (2e20)^2 + (2e20)^2 and (3e20)^2 + (3e20)^2 both exceed f32::MAX.
+        let centroids = vec![-1e20f32, -1e20, -2e20, -2e20];
+        let (_c, d) = assign_nearest(&[1e20, 1e20], &centroids, 2, 2, DistanceMetric::EuclideanSq);
+        assert!(
+            d.is_finite(),
+            "EuclideanSq overflow leaked a non-finite distance: {d}"
+        );
+
+        // DotProduct negates, so its overflow is -inf, which sorts to the FRONT
+        // of a nearest-neighbour heap rather than the back.
+        let (_c, d) = assign_nearest(&[1e20, 1e20], &centroids, 2, 2, DistanceMetric::DotProduct);
+        assert!(
+            d.is_finite(),
+            "DotProduct overflow leaked a non-finite distance: {d}"
+        );
+        assert!(
+            d >= 0.0,
+            "an unmeasurable distance must not sort ahead of real ones: {d}"
+        );
+
+        // No centroid examinable: the loop breaks immediately and `best_d` is
+        // still the INFINITY seed.
+        let (_c, d) = assign_nearest(&[1.0, 2.0], &[], 2, 4, DistanceMetric::EuclideanSq);
+        assert!(
+            d.is_finite(),
+            "empty centroids leaked a non-finite distance: {d}"
+        );
+        let (_c, d) = assign_nearest(&[1.0, 2.0], &[1.0], 2, 1, DistanceMetric::EuclideanSq);
+        assert!(
+            d.is_finite(),
+            "short centroids leaked a non-finite distance: {d}"
+        );
+    }
+
+    #[test]
+    fn assign_nearest_basic() {
+        let centroids = vec![0.0, 0.0, 10.0, 10.0];
+        let (c, _d) = assign_nearest(&[9.0, 9.0], &centroids, 2, 2, DistanceMetric::EuclideanSq);
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn nearest_clusters_ordering() {
+        let centroids = vec![0.0, 0.0, 5.0, 5.0, 10.0, 10.0];
+        let result = nearest_clusters(
+            &[4.0, 4.0],
+            &centroids,
+            2,
+            3,
+            2,
+            DistanceMetric::EuclideanSq,
+            crate::probe_select::DiversityConfig { lambda: 0.0 },
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 1); // closest is (5,5)
+        assert_eq!(result[1].0, 0); // next is (0,0)
+    }
+}
+
+/// Reorder centroids so that geometrically close centroids receive close
+/// cluster IDs, via greedy nearest-neighbour chaining.
+///
+/// Cluster blobs are stored in a B-tree keyed by cluster ID, so ordered keys
+/// place adjacent IDs on adjacent pages. A search probes the `nprobe` centroids
+/// nearest the query -- which are, by definition, near each other. Numbering
+/// them arbitrarily scatters those reads across the tree; numbering them by
+/// spatial adjacency turns them into a near-sequential run, which is friendlier
+/// to the page cache, to readahead, and to the flash FTL's erase blocks.
+///
+/// This is the software form of the locality-aware centroid mapping in D-NOVA
+/// (arXiv 2607.17538), which grouped geometrically close centroids by greedy
+/// nearest-neighbour chaining and reported roughly 40% fewer sub-block
+/// activations.
+///
+/// Purely a relabelling, applied during training before any vector is assigned,
+/// so it cannot change which clusters a query probes or what it finds. Recall
+/// is unaffected by construction.
+///
+/// `O(k^2 * dim)`, run once per `train()` -- negligible beside k-means itself.
+#[must_use]
+pub(crate) fn reorder_centroids_for_locality(
+    centroids: &[f32],
+    dim: usize,
+    metric: DistanceMetric,
+) -> Vec<f32> {
+    if dim == 0 || centroids.len() < dim.saturating_mul(2) {
+        return centroids.to_vec();
+    }
+    let k = centroids.len() / dim;
+
+    let mut visited = alloc::vec![false; k];
+    let mut order = Vec::with_capacity(k);
+    let mut current = 0usize;
+    visited[0] = true;
+    order.push(0usize);
+
+    for _ in 1..k {
+        let cur = &centroids[current * dim..(current + 1) * dim];
+        let mut best: Option<(usize, f32)> = None;
+        for cand in 0..k {
+            if visited[cand] {
+                continue;
+            }
+            let other = &centroids[cand * dim..(cand + 1) * dim];
+            let d = super::adc::subvector_distance_pub(cur, other, metric);
+            if best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((cand, d));
+            }
+        }
+        // `best` is always Some: the loop runs k-1 times and one centroid is
+        // unvisited on each pass.
+        let Some((next, _)) = best else { break };
+        visited[next] = true;
+        order.push(next);
+        current = next;
+    }
+
+    let mut out = Vec::with_capacity(centroids.len());
+    for &idx in &order {
+        out.extend_from_slice(&centroids[idx * dim..(idx + 1) * dim]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod locality_tests {
+    use super::*;
+
+    /// Relabelling must preserve the multiset of centroids exactly -- it may
+    /// only permute them. If it dropped or duplicated one, assignment would
+    /// silently change and recall with it.
+    #[test]
+    fn reorder_is_a_permutation() {
+        let dim = 2;
+        let centroids: Vec<f32> = alloc::vec![0.0, 0.0, 10.0, 10.0, 0.5, 0.5, 9.5, 9.5];
+        let out = reorder_centroids_for_locality(&centroids, dim, DistanceMetric::EuclideanSq);
+        assert_eq!(out.len(), centroids.len());
+
+        let mut got: Vec<[u32; 2]> = out
+            .chunks_exact(dim)
+            .map(|c| [c[0].to_bits(), c[1].to_bits()])
+            .collect();
+        let mut want: Vec<[u32; 2]> = centroids
+            .chunks_exact(dim)
+            .map(|c| [c[0].to_bits(), c[1].to_bits()])
+            .collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "reordering must be a pure permutation");
+    }
+
+    /// Two well-separated groups must come out contiguous, which is the whole
+    /// point: probing one group then reads a near-sequential ID range.
+    #[test]
+    fn reorder_groups_neighbours_together() {
+        let dim = 2;
+        // Interleaved input: near, far, near, far.
+        let centroids: Vec<f32> = alloc::vec![0.0, 0.0, 100.0, 100.0, 1.0, 1.0, 101.0, 101.0];
+        let out = reorder_centroids_for_locality(&centroids, dim, DistanceMetric::EuclideanSq);
+        let xs: Vec<f32> = out.chunks_exact(dim).map(|c| c[0]).collect();
+        // Chain starts at the first centroid and walks to its nearest
+        // neighbour, so the two low points precede the two high points.
+        assert!(
+            xs[0] < 50.0 && xs[1] < 50.0,
+            "near group must be contiguous: {xs:?}"
+        );
+        assert!(
+            xs[2] > 50.0 && xs[3] > 50.0,
+            "far group must be contiguous: {xs:?}"
+        );
+    }
+
+    /// Degenerate inputs must pass through untouched rather than panic.
+    #[test]
+    fn reorder_handles_degenerate_input() {
+        assert!(reorder_centroids_for_locality(&[], 4, DistanceMetric::EuclideanSq).is_empty());
+        let single = alloc::vec![1.0f32, 2.0];
+        assert_eq!(
+            reorder_centroids_for_locality(&single, 2, DistanceMetric::EuclideanSq),
+            single
+        );
+        assert_eq!(
+            reorder_centroids_for_locality(&single, 0, DistanceMetric::EuclideanSq),
+            single
+        );
+    }
+}

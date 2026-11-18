@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 240" fill="none">
+  <title>The main board connects the local library, display, and radios to a separate power base</title>
+  <path fill="#ece9e3" d="M0 0h1000v240H0z"/>
+  <path stroke="#aaa198" d="M220 117h94m368 0h100"/>
+  <circle cx="220" cy="117" r="3" fill="#bc2821"/><circle cx="314" cy="117" r="3" fill="#bc2821"/>
+  <path stroke="#bc2821" stroke-dasharray="4 5" d="M682 117h100"/>
+  <path fill="#f6f3ec" stroke="#a69d94" d="M92 61h83l40 39v76H92Z"/>
+  <path stroke="#8c8379" d="M175 61v39h40M109 77h10m4 0h10m4 0h10m-38 11h10m4 0h10m4 0h10"/>
+  <rect x="314" y="49" width="368" height="135" rx="4" fill="#f6f3ec" stroke="#a69d94"/>
+  <rect x="342" y="78" width="81" height="75" rx="2" fill="#e1dbd2" stroke="#8c8379"/>
+  <path stroke="#8c8379" d="M423 93h43v-21h84m-127 64h43v27h84m-84-46h84"/>
+  <rect x="550" y="62" width="102" height="21" rx="2" stroke="#8c8379"/>
+  <rect x="550" y="107" width="102" height="21" rx="2" stroke="#8c8379"/>
+  <rect x="550" y="152" width="102" height="21" rx="2" stroke="#8c8379"/>
+  <rect x="782" y="49" width="134" height="135" rx="4" stroke="#a69d94" stroke-dasharray="4 5"/>
+  <g fill="#ded8ce" stroke="#8c8379"><rect x="799" y="71" width="26" height="92" rx="11"/><rect x="836" y="71" width="26" height="92" rx="11"/><rect x="873" y="71" width="26" height="92" rx="11"/></g>
+  <g fill="#40372f" font-family="Arial,sans-serif" text-anchor="middle"><text x="153" y="205" font-size="13">Local library</text><text x="383" y="121" font-size="12">Compute</text><text x="601" y="77" font-size="10">E-paper</text><text x="601" y="122" font-size="10">Wi-Fi / Bluetooth</text><text x="601" y="167" font-size="10">LoRa</text><text x="498" y="205" font-size="13">Main board</text><text x="849" y="205" font-size="13">Power base</text></g>
+</svg>

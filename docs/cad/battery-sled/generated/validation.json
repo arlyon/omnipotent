@@ -1,0 +1,19 @@
+{
+  "all_parts_valid_single_solids": true,
+  "no_cell_interference": true,
+  "pins_clear_frame_keeper_and_carriers": true,
+  "frame_and_closures_do_not_overlap": true,
+  "wire_envelopes_clear_structure_cells_and_each_other": true,
+  "stacked_interface_clears_at_working_compression": true,
+  "side_loading_sweeps_clear_frame": true,
+  "top_insert_carriers_clear_frame": true,
+  "nominal_compression_mm": 0.4953,
+  "maximum_stroke_mm": 0.9906,
+  "frame_dimensions_mm": [
+    74.2,
+    29.0,
+    80.0
+  ],
+  "cell_radial_clearance_mm": 0.3,
+  "prototype_only": true
+}

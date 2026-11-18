@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 260" fill="none">
+  <title>Choose reading from the local library, then keep a copy on an e-reader</title>
+  <path fill="#edeae5" d="M0 0h640v260H0z"/>
+  <rect x="61" y="30" width="143" height="192" rx="15" fill="#c22821"/>
+  <rect x="74" y="44" width="117" height="73" rx="5" fill="#262321"/>
+  <rect x="79" y="49" width="107" height="63" rx="2" fill="#f4f0e4"/>
+  <g fill="#292522" font-family="Arial,sans-serif"><text x="88" y="67" font-size="9">LOCAL LIBRARY</text><text x="88" y="85" font-size="8">Books &amp; manuals</text></g>
+  <path stroke="#f5ece3" stroke-width="7" stroke-linecap="round" d="M135 154h43m-43 20h43"/>
+  <path stroke="#bbb2a9" stroke-width="1.3" d="M238 128h113m-12-9 12 9-12 9"/>
+  <rect x="390" y="22" width="188" height="212" rx="12" fill="#292522"/>
+  <rect x="401" y="34" width="166" height="183" rx="3" fill="#f4f0e4"/>
+  <g fill="#292522" font-family="Arial,sans-serif"><text x="416" y="61" font-size="15">Field manual</text><text x="416" y="79" font-size="8">Your copy. Ready to read.</text></g>
+  <path stroke="#82796d" d="M416 95h135m-135 12h121m-121 12h130m-130 71h135m-135 10h115"/>
+  <path stroke="#82796d" stroke-width="1.2" d="m462 138 26-12 25 11v25l-25 12-26-12Zm0 0 26 12 25-13m-25 13v24"/>
+  <circle cx="484" cy="226" r="2" fill="#8e867b"/>
+  <g fill="#5e554d" font-family="Arial,sans-serif" font-size="10"><text x="85" y="246">Omnipotent</text><text x="413" y="250">Your compatible reader</text></g>
+</svg>

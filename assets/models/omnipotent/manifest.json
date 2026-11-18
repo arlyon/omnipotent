@@ -1,0 +1,108 @@
+{
+  "source_archive": "model-obj.zip",
+  "source_archive_sha256": "8bb3ebe3421b696c2fce2a089f881202d5786785f62070e3cc2c8044dd072b9f",
+  "source_obj_sha256": "893ea1a212ce9c1ffee5b0adb333dcaad3e6aee78909d7ff3839c31c9cd6377d",
+  "blender": "5.2.2 LTS",
+  "normalization": {
+    "source_center_blender_z_up": [
+      -0.0008384883403778076,
+      0.0005465149879455566,
+      -0.00479397177696228
+    ],
+    "scale": 1.051277586282198,
+    "longest_axis": 2,
+    "glb_axes": "glTF right-handed Y-up"
+  },
+  "parts": [
+    {
+      "source": "mesh_1_1",
+      "node": "unidentified_fragment_1",
+      "vertices": 76,
+      "source_faces": 84,
+      "faces": 84,
+      "triangles": 84
+    },
+    {
+      "source": "mesh_2_1",
+      "node": "unidentified_fragment_2",
+      "vertices": 565,
+      "source_faces": 568,
+      "faces": 568,
+      "triangles": 568
+    },
+    {
+      "source": "mesh_3_1",
+      "node": "unidentified_fragment_3",
+      "vertices": 42,
+      "source_faces": 40,
+      "faces": 40,
+      "triangles": 40
+    },
+    {
+      "source": "mesh_4_1",
+      "node": "unidentified_fragment_4",
+      "vertices": 175,
+      "source_faces": 202,
+      "faces": 202,
+      "triangles": 202
+    },
+    {
+      "source": "mesh_5_1",
+      "node": "enclosure_with_antenna",
+      "vertices": 8039,
+      "source_faces": 10046,
+      "faces": 10044,
+      "triangles": 10044
+    },
+    {
+      "source": "mesh_6_1",
+      "node": "sled_assembly",
+      "vertices": 12798,
+      "source_faces": 14858,
+      "faces": 14858,
+      "triangles": 14858
+    },
+    {
+      "source": "generated",
+      "node": "epaper_surface",
+      "vertices": 29,
+      "source_faces": 0,
+      "faces": 28,
+      "triangles": 28
+    }
+  ],
+  "variants": [
+    {
+      "file": "omnipotent-1k.glb",
+      "texture_size": 1024,
+      "bytes": 5294792
+    },
+    {
+      "file": "omnipotent-2k.glb",
+      "texture_size": 2048,
+      "bytes": 12790196
+    }
+  ],
+  "geometry_note": "No decimation applied. Blender's OBJ importer omits two enclosure faces from the source; the source contains zero-area triangles.",
+  "material_note": "Screen atlas regions repainted paper, neutral tangent normal, matte/nonmetallic. Independent screen material has no texture or bump/normal map. Surrounding shell maps preserved.",
+  "screen": {
+    "resolution": [
+      296,
+      160
+    ],
+    "cleaned_atlas_pixels": 86344,
+    "aspect": 1.85,
+    "source_bounds": [
+      -0.307,
+      0.45,
+      0.16081081081081072,
+      0.57
+    ]
+  },
+  "limitations": [
+    "antenna remains part of enclosure mesh",
+    "screen fit is approximate concept geometry, not physical CAD",
+    "four small unidentified fragments are retained without mechanical animation assignments",
+    "source geometry is a visual concept, not dimensionally validated engineering CAD"
+  ]
+}

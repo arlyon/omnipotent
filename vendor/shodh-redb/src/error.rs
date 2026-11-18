@@ -1,0 +1,1502 @@
+use crate::tree_store::{FILE_FORMAT_VERSION3, MAX_VALUE_LENGTH, PageNumber};
+use crate::{ReadTransaction, TypeName};
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use core::fmt::{Display, Formatter};
+use core::panic;
+
+#[cfg(feature = "std")]
+use crate::group_commit::GroupCommitError;
+#[cfg(feature = "std")]
+use std::sync::PoisonError;
+
+/// Error type for storage backend operations.
+///
+/// Under `std`, this wraps `std::io::Error`. Under `no_std`, it provides
+/// a string-based error representation.
+#[derive(Debug)]
+pub enum BackendError {
+    #[cfg(feature = "std")]
+    Io(std::io::Error),
+    #[cfg(not(feature = "std"))]
+    Message(String),
+}
+
+impl Display for BackendError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            #[cfg(feature = "std")]
+            BackendError::Io(err) => write!(f, "{err}"),
+            #[cfg(not(feature = "std"))]
+            BackendError::Message(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BackendError {}
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for BackendError {
+    fn from(err: std::io::Error) -> Self {
+        BackendError::Io(err)
+    }
+}
+
+impl BackendError {
+    /// Returns the `ErrorKind` of the underlying I/O error.
+    #[cfg(feature = "std")]
+    pub fn kind(&self) -> std::io::ErrorKind {
+        match self {
+            BackendError::Io(e) => e.kind(),
+        }
+    }
+}
+
+/// General errors directly from the storage layer
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StorageError {
+    /// The Database is corrupted
+    Corrupted(String),
+    /// An internal invariant was violated, indicating a bug in the database engine.
+    /// This is NOT caused by on-disk corruption -- it means the code has a logic error.
+    /// If you encounter this error, please file a bug report.
+    Internal(String),
+    /// The value being inserted exceeds the maximum of 3GiB
+    ValueTooLarge(usize),
+    /// A merge operator produced a value whose length does not match the
+    /// table's fixed-width value type. Writing it would store bytes that
+    /// cannot be deserialized back into the declared type.
+    MergeValueWidthMismatch {
+        /// The width the table's value type requires
+        expected: usize,
+        /// The length the merge operator returned
+        actual: usize,
+    },
+    /// A blob with the given sequence ID was not found in the blob store
+    BlobNotFound(u64),
+    /// Blob data checksum does not match the stored checksum
+    BlobChecksumMismatch {
+        /// Blob sequence number
+        sequence: u64,
+        /// Checksum stored in metadata
+        expected: u128,
+        /// Checksum computed from the blob data
+        actual: u128,
+    },
+    /// A streaming blob writer is already active on this transaction
+    BlobWriterActive,
+    /// The streaming blob writer has already been finished
+    BlobWriterFinished,
+    /// The requested byte range exceeds the blob's length
+    BlobRangeOutOfBounds {
+        /// Total blob length in bytes
+        blob_length: u64,
+        /// Requested range start offset
+        requested_offset: u64,
+        /// Requested range length
+        requested_length: u64,
+    },
+    /// The configured memory budget has been exceeded and the operation cannot proceed
+    MemoryBudgetExceeded {
+        /// The configured memory budget in bytes
+        budget: usize,
+        /// Current memory usage in bytes
+        used: usize,
+    },
+    /// The requested history snapshot was not found for the given transaction ID
+    HistorySnapshotNotFound(u64),
+    /// A B-tree page has an unexpected type byte
+    InvalidPageType {
+        /// Page region
+        page_region: u32,
+        /// Page index within region
+        page_index: u32,
+        /// Page order
+        page_order: u8,
+        /// The invalid type byte found
+        found: u8,
+    },
+    /// A child pointer or checksum on a B-tree branch page is invalid
+    InvalidChildRef {
+        /// Page region
+        page_region: u32,
+        /// Page index within region
+        page_index: u32,
+        /// Page order
+        page_order: u8,
+        /// Child index within the branch node
+        child_index: usize,
+        /// Whether this is a checksum error (true) or a pointer error (false)
+        is_checksum: bool,
+    },
+    /// An entry index on a B-tree page is invalid or out of range
+    InvalidEntryIndex {
+        /// Page region
+        page_region: u32,
+        /// Page index within region
+        page_index: u32,
+        /// Page order
+        page_order: u8,
+        /// The invalid entry index
+        entry_index: usize,
+    },
+    /// A B-tree page has structural corruption
+    PageCorrupted {
+        /// Page region
+        page_region: u32,
+        /// Page index within region
+        page_index: u32,
+        /// Page order
+        page_order: u8,
+        /// Static description of the corruption
+        detail: &'static str,
+    },
+    /// A CDC cursor position falls behind the retention window, meaning
+    /// entries have been pruned and the consumer may have missed changes.
+    CdcCursorBehindRetention {
+        /// The cursor position (transaction ID the consumer last processed)
+        cursor_txn_id: u64,
+        /// The oldest transaction ID still in the CDC log
+        oldest_retained_txn_id: u64,
+    },
+    /// A configuration parameter is invalid (e.g. page size, region size).
+    InvalidConfiguration {
+        /// Description of the invalid configuration
+        message: String,
+    },
+    /// The IVF-PQ index has not been trained yet
+    IndexNotTrained {
+        /// Name of the untrained index
+        index_name: String,
+    },
+    /// Vector dimensionality does not match the index configuration
+    DimensionMismatch {
+        /// Name of the index
+        index_name: String,
+        /// Dimension the index was configured with
+        expected: usize,
+        /// Dimension of the provided vector
+        actual: usize,
+    },
+    /// IVF-PQ index configuration is invalid
+    InvalidIndexConfig {
+        /// Description of the invalid configuration
+        detail: String,
+    },
+    /// On-disk format validation failed (magic number, version, layout, record structure)
+    FormatError {
+        /// Description of the format violation
+        detail: String,
+    },
+    /// Database requires recovery before this operation can proceed
+    RecoveryRequired,
+    /// Storage space exhausted; the allocator cannot grow further
+    OutOfSpace,
+    /// Timed out waiting for a write transaction lock (`no_std` spin-lock).
+    /// This is transient contention, not corruption.
+    LockTimeout(String),
+    Io(BackendError),
+    PreviousIo,
+    DatabaseClosed,
+    LockPoisoned(&'static panic::Location<'static>),
+}
+
+#[cfg(feature = "std")]
+impl<T> From<PoisonError<T>> for StorageError {
+    fn from(_: PoisonError<T>) -> StorageError {
+        StorageError::LockPoisoned(panic::Location::caller())
+    }
+}
+
+impl From<BackendError> for StorageError {
+    fn from(err: BackendError) -> StorageError {
+        StorageError::Io(err)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for StorageError {
+    fn from(err: std::io::Error) -> StorageError {
+        StorageError::Io(BackendError::Io(err))
+    }
+}
+
+impl From<StorageError> for Error {
+    fn from(err: StorageError) -> Error {
+        match err {
+            StorageError::Corrupted(msg) => Error::Corrupted(msg),
+            StorageError::Internal(msg) => Error::Internal(msg),
+            StorageError::ValueTooLarge(x) => Error::ValueTooLarge(x),
+            StorageError::MergeValueWidthMismatch { expected, actual } => {
+                Error::MergeValueWidthMismatch { expected, actual }
+            }
+            StorageError::BlobNotFound(seq) => Error::BlobNotFound(seq),
+            StorageError::BlobChecksumMismatch {
+                sequence,
+                expected,
+                actual,
+            } => Error::BlobChecksumMismatch {
+                sequence,
+                expected,
+                actual,
+            },
+            StorageError::BlobWriterActive => Error::BlobWriterActive,
+            StorageError::BlobWriterFinished => Error::BlobWriterFinished,
+            StorageError::BlobRangeOutOfBounds {
+                blob_length,
+                requested_offset,
+                requested_length,
+            } => Error::BlobRangeOutOfBounds {
+                blob_length,
+                requested_offset,
+                requested_length,
+            },
+            StorageError::MemoryBudgetExceeded { budget, used } => {
+                Error::MemoryBudgetExceeded { budget, used }
+            }
+            StorageError::HistorySnapshotNotFound(id) => Error::HistorySnapshotNotFound(id),
+            StorageError::InvalidPageType {
+                page_region,
+                page_index,
+                page_order,
+                found,
+            } => Error::InvalidPageType {
+                page_region,
+                page_index,
+                page_order,
+                found,
+            },
+            StorageError::InvalidChildRef {
+                page_region,
+                page_index,
+                page_order,
+                child_index,
+                is_checksum,
+            } => Error::InvalidChildRef {
+                page_region,
+                page_index,
+                page_order,
+                child_index,
+                is_checksum,
+            },
+            StorageError::InvalidEntryIndex {
+                page_region,
+                page_index,
+                page_order,
+                entry_index,
+            } => Error::InvalidEntryIndex {
+                page_region,
+                page_index,
+                page_order,
+                entry_index,
+            },
+            StorageError::PageCorrupted {
+                page_region,
+                page_index,
+                page_order,
+                detail,
+            } => Error::PageCorrupted {
+                page_region,
+                page_index,
+                page_order,
+                detail,
+            },
+            StorageError::CdcCursorBehindRetention {
+                cursor_txn_id,
+                oldest_retained_txn_id,
+            } => Error::CdcCursorBehindRetention {
+                cursor_txn_id,
+                oldest_retained_txn_id,
+            },
+            StorageError::InvalidConfiguration { message } => {
+                Error::InvalidConfiguration { message }
+            }
+            StorageError::IndexNotTrained { index_name } => Error::IndexNotTrained { index_name },
+            StorageError::DimensionMismatch {
+                index_name,
+                expected,
+                actual,
+            } => Error::DimensionMismatch {
+                index_name,
+                expected,
+                actual,
+            },
+            StorageError::InvalidIndexConfig { detail } => Error::InvalidIndexConfig { detail },
+            StorageError::FormatError { detail } => Error::FormatError { detail },
+            StorageError::RecoveryRequired => Error::RecoveryRequired,
+            StorageError::OutOfSpace => Error::OutOfSpace,
+            StorageError::LockTimeout(msg) => Error::LockTimeout(msg),
+            StorageError::Io(x) => Error::Io(x),
+            StorageError::PreviousIo => Error::PreviousIo,
+            StorageError::DatabaseClosed => Error::DatabaseClosed,
+            StorageError::LockPoisoned(location) => Error::LockPoisoned(location),
+        }
+    }
+}
+
+impl Display for StorageError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StorageError::Corrupted(msg) => {
+                write!(f, "DB corrupted: {msg}")
+            }
+            StorageError::Internal(msg) => {
+                write!(f, "Internal error (this is a bug): {msg}")
+            }
+            StorageError::MergeValueWidthMismatch { expected, actual } => write!(
+                f,
+                "Merge operator returned {actual} bytes, but the table's value type requires exactly {expected}"
+            ),
+            StorageError::ValueTooLarge(len) => {
+                write!(
+                    f,
+                    "The value (length={len}) being inserted exceeds the maximum of {}GiB",
+                    MAX_VALUE_LENGTH / 1024 / 1024 / 1024
+                )
+            }
+            StorageError::BlobNotFound(seq) => {
+                write!(f, "Blob not found: sequence={seq}")
+            }
+            StorageError::BlobChecksumMismatch {
+                sequence,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Blob checksum mismatch: sequence={sequence}, expected={expected:#034x}, actual={actual:#034x}"
+                )
+            }
+            StorageError::BlobWriterActive => {
+                write!(
+                    f,
+                    "Cannot create blob writer or store blob while another writer is active"
+                )
+            }
+            StorageError::BlobWriterFinished => {
+                write!(f, "Blob writer has already been finished")
+            }
+            StorageError::BlobRangeOutOfBounds {
+                blob_length,
+                requested_offset,
+                requested_length,
+            } => {
+                write!(
+                    f,
+                    "Blob range out of bounds: blob_length={blob_length}, requested offset={requested_offset}, length={requested_length}"
+                )
+            }
+            StorageError::MemoryBudgetExceeded { budget, used } => {
+                write!(
+                    f,
+                    "Memory budget exceeded: budget={budget} bytes, used={used} bytes"
+                )
+            }
+            StorageError::HistorySnapshotNotFound(id) => {
+                write!(f, "History snapshot not found for transaction id={id}")
+            }
+            StorageError::InvalidPageType {
+                page_region,
+                page_index,
+                page_order,
+                found,
+            } => {
+                write!(
+                    f,
+                    "Invalid page type byte {found} on page ({page_region}, {page_index}, order={page_order}), expected LEAF (1) or BRANCH (2)"
+                )
+            }
+            StorageError::InvalidChildRef {
+                page_region,
+                page_index,
+                page_order,
+                child_index,
+                is_checksum,
+            } => {
+                let kind = if *is_checksum { "checksum" } else { "pointer" };
+                write!(
+                    f,
+                    "Invalid child {kind} at index {child_index} on page ({page_region}, {page_index}, order={page_order})"
+                )
+            }
+            StorageError::InvalidEntryIndex {
+                page_region,
+                page_index,
+                page_order,
+                entry_index,
+            } => {
+                write!(
+                    f,
+                    "Invalid entry index {entry_index} on page ({page_region}, {page_index}, order={page_order})"
+                )
+            }
+            StorageError::PageCorrupted {
+                page_region,
+                page_index,
+                page_order,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "Page ({page_region}, {page_index}, order={page_order}) corrupted: {detail}"
+                )
+            }
+            StorageError::CdcCursorBehindRetention {
+                cursor_txn_id,
+                oldest_retained_txn_id,
+            } => {
+                write!(
+                    f,
+                    "CDC cursor (txn_id={cursor_txn_id}) is behind the retention window (oldest retained txn_id={oldest_retained_txn_id})"
+                )
+            }
+            StorageError::InvalidConfiguration { message } => {
+                write!(f, "Invalid configuration: {message}")
+            }
+            StorageError::IndexNotTrained { index_name } => {
+                write!(f, "IVF-PQ index '{index_name}' has not been trained")
+            }
+            StorageError::DimensionMismatch {
+                index_name,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Dimension mismatch on index '{index_name}': expected {expected}, got {actual}"
+                )
+            }
+            StorageError::InvalidIndexConfig { detail } => {
+                write!(f, "Invalid index configuration: {detail}")
+            }
+            StorageError::FormatError { detail } => {
+                write!(f, "Format error: {detail}")
+            }
+            StorageError::RecoveryRequired => {
+                write!(
+                    f,
+                    "Database recovery required. Close and re-open the database."
+                )
+            }
+            StorageError::OutOfSpace => {
+                write!(f, "Storage space exhausted: allocator cannot grow further")
+            }
+            StorageError::LockTimeout(msg) => {
+                write!(f, "Lock timeout: {msg}")
+            }
+            StorageError::Io(err) => {
+                write!(f, "I/O error: {err}")
+            }
+            StorageError::DatabaseClosed => {
+                write!(f, "Database has been closed")
+            }
+            StorageError::PreviousIo => {
+                write!(
+                    f,
+                    "Previous I/O error occurred. Please close and re-open the database."
+                )
+            }
+            StorageError::LockPoisoned(location) => {
+                write!(f, "Poisoned internal lock: {location}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for StorageError {}
+
+impl StorageError {
+    pub(crate) fn invalid_page_type(page: PageNumber, found: u8) -> Self {
+        StorageError::InvalidPageType {
+            page_region: page.region,
+            page_index: page.page_index,
+            page_order: page.page_order,
+            found,
+        }
+    }
+
+    pub(crate) fn invalid_child_pointer(page: PageNumber, child_index: usize) -> Self {
+        StorageError::InvalidChildRef {
+            page_region: page.region,
+            page_index: page.page_index,
+            page_order: page.page_order,
+            child_index,
+            is_checksum: false,
+        }
+    }
+
+    pub(crate) fn invalid_child_checksum(page: PageNumber, child_index: usize) -> Self {
+        StorageError::InvalidChildRef {
+            page_region: page.region,
+            page_index: page.page_index,
+            page_order: page.page_order,
+            child_index,
+            is_checksum: true,
+        }
+    }
+
+    pub(crate) fn invalid_entry_index(page: PageNumber, entry_index: usize) -> Self {
+        StorageError::InvalidEntryIndex {
+            page_region: page.region,
+            page_index: page.page_index,
+            page_order: page.page_order,
+            entry_index,
+        }
+    }
+
+    pub(crate) fn page_corrupted(page: PageNumber, detail: &'static str) -> Self {
+        StorageError::PageCorrupted {
+            page_region: page.region,
+            page_index: page.page_index,
+            page_order: page.page_order,
+            detail,
+        }
+    }
+
+    pub(crate) fn invalid_config(message: impl Into<String>) -> Self {
+        StorageError::InvalidConfiguration {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn index_not_trained(index_name: impl Into<String>) -> Self {
+        StorageError::IndexNotTrained {
+            index_name: index_name.into(),
+        }
+    }
+
+    pub(crate) fn dimension_mismatch(
+        index_name: impl Into<String>,
+        expected: usize,
+        actual: usize,
+    ) -> Self {
+        StorageError::DimensionMismatch {
+            index_name: index_name.into(),
+            expected,
+            actual,
+        }
+    }
+
+    pub(crate) fn invalid_index_config(detail: impl Into<String>) -> Self {
+        StorageError::InvalidIndexConfig {
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn format_error(detail: impl Into<String>) -> Self {
+        StorageError::FormatError {
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn corrupted(detail: impl Into<String>) -> Self {
+        StorageError::Corrupted(detail.into())
+    }
+}
+
+/// Errors related to opening tables
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TableError {
+    /// Table types didn't match.
+    TableTypeMismatch {
+        table: String,
+        key: TypeName,
+        value: TypeName,
+    },
+    /// The table is a multimap table
+    TableIsMultimap(String),
+    /// The table is not a multimap table
+    TableIsNotMultimap(String),
+    TypeDefinitionChanged {
+        name: TypeName,
+        alignment: usize,
+        width: Option<usize>,
+    },
+    /// Table name does not match any table in database
+    TableDoesNotExist(String),
+    /// Table name already exists in the database
+    TableExists(String),
+    // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
+    // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
+    TableAlreadyOpen(String, &'static panic::Location<'static>),
+    /// Error from underlying storage
+    Storage(StorageError),
+}
+
+impl TableError {
+    pub(crate) fn into_storage_error_or_internal(self, msg: &str) -> StorageError {
+        match self {
+            TableError::TableTypeMismatch { .. }
+            | TableError::TableIsMultimap(_)
+            | TableError::TableIsNotMultimap(_)
+            | TableError::TypeDefinitionChanged { .. }
+            | TableError::TableDoesNotExist(_)
+            | TableError::TableExists(_)
+            | TableError::TableAlreadyOpen(_, _) => {
+                StorageError::Internal(format!("{msg}: {self}"))
+            }
+            TableError::Storage(storage) => storage,
+        }
+    }
+}
+
+impl From<TableError> for Error {
+    fn from(err: TableError) -> Error {
+        match err {
+            TableError::TypeDefinitionChanged {
+                name,
+                alignment,
+                width,
+            } => Error::TypeDefinitionChanged {
+                name,
+                alignment,
+                width,
+            },
+            TableError::TableTypeMismatch { table, key, value } => {
+                Error::TableTypeMismatch { table, key, value }
+            }
+            TableError::TableIsMultimap(table) => Error::TableIsMultimap(table),
+            TableError::TableIsNotMultimap(table) => Error::TableIsNotMultimap(table),
+            TableError::TableDoesNotExist(table) => Error::TableDoesNotExist(table),
+            TableError::TableExists(table) => Error::TableExists(table),
+            TableError::TableAlreadyOpen(name, location) => Error::TableAlreadyOpen(name, location),
+            TableError::Storage(storage) => storage.into(),
+        }
+    }
+}
+
+impl From<StorageError> for TableError {
+    fn from(err: StorageError) -> TableError {
+        TableError::Storage(err)
+    }
+}
+
+impl Display for TableError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TableError::TypeDefinitionChanged {
+                name,
+                alignment,
+                width,
+            } => {
+                write!(
+                    f,
+                    "Current definition of {} does not match stored definition (width={:?}, alignment={})",
+                    name.name(),
+                    width,
+                    alignment,
+                )
+            }
+            TableError::TableTypeMismatch { table, key, value } => {
+                write!(
+                    f,
+                    "{table} is of type Table<{}, {}>",
+                    key.name(),
+                    value.name(),
+                )
+            }
+            TableError::TableIsMultimap(table) => {
+                write!(f, "{table} is a multimap table")
+            }
+            TableError::TableIsNotMultimap(table) => {
+                write!(f, "{table} is not a multimap table")
+            }
+            TableError::TableDoesNotExist(table) => {
+                write!(f, "Table '{table}' does not exist")
+            }
+            TableError::TableExists(table) => {
+                write!(f, "Table '{table}' already exists")
+            }
+            TableError::TableAlreadyOpen(name, location) => {
+                write!(f, "Table '{name}' already opened at: {location}")
+            }
+            TableError::Storage(storage) => storage.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for TableError {}
+
+/// Errors related to opening a database
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DatabaseError {
+    /// The Database is already open. Cannot acquire lock.
+    DatabaseAlreadyOpen,
+    /// [`crate::RepairSession::abort`] was called or repair was aborted for another reason (such as the database being read-only).
+    RepairAborted,
+    /// The database file is in an old file format and must be manually upgraded
+    UpgradeRequired(u8),
+    /// Error from underlying storage
+    Storage(StorageError),
+}
+
+impl From<DatabaseError> for Error {
+    fn from(err: DatabaseError) -> Error {
+        match err {
+            DatabaseError::DatabaseAlreadyOpen => Error::DatabaseAlreadyOpen,
+            DatabaseError::RepairAborted => Error::RepairAborted,
+            DatabaseError::UpgradeRequired(x) => Error::UpgradeRequired(x),
+            DatabaseError::Storage(storage) => storage.into(),
+        }
+    }
+}
+
+impl From<BackendError> for DatabaseError {
+    fn from(err: BackendError) -> DatabaseError {
+        DatabaseError::Storage(StorageError::Io(err))
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for DatabaseError {
+    fn from(err: std::io::Error) -> DatabaseError {
+        DatabaseError::Storage(StorageError::Io(BackendError::Io(err)))
+    }
+}
+
+impl From<StorageError> for DatabaseError {
+    fn from(err: StorageError) -> DatabaseError {
+        DatabaseError::Storage(err)
+    }
+}
+
+impl Display for DatabaseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DatabaseError::UpgradeRequired(actual) => {
+                write!(
+                    f,
+                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION3}, but file is version {actual}"
+                )
+            }
+            DatabaseError::RepairAborted => {
+                write!(f, "Database repair aborted.")
+            }
+            DatabaseError::DatabaseAlreadyOpen => {
+                write!(f, "Database already open. Cannot acquire lock.")
+            }
+            DatabaseError::Storage(storage) => storage.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DatabaseError {}
+
+/// Errors related to savepoints
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SavepointError {
+    /// This savepoint is invalid or cannot be created.
+    ///
+    /// Savepoints become invalid when an older savepoint is restored after it was created,
+    /// and savepoints cannot be created if the transaction is "dirty" (any tables have been opened)
+    InvalidSavepoint,
+    /// Error from underlying storage
+    Storage(StorageError),
+}
+
+impl From<SavepointError> for Error {
+    fn from(err: SavepointError) -> Error {
+        match err {
+            SavepointError::InvalidSavepoint => Error::InvalidSavepoint,
+            SavepointError::Storage(storage) => storage.into(),
+        }
+    }
+}
+
+impl From<StorageError> for SavepointError {
+    fn from(err: StorageError) -> SavepointError {
+        SavepointError::Storage(err)
+    }
+}
+
+impl Display for SavepointError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SavepointError::InvalidSavepoint => {
+                write!(f, "Savepoint is invalid or cannot be created.")
+            }
+            SavepointError::Storage(storage) => storage.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SavepointError {}
+
+/// Errors related to compaction
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CompactionError {
+    /// A persistent savepoint exists
+    PersistentSavepointExists,
+    /// A ephemeral savepoint exists
+    EphemeralSavepointExists,
+    /// A transaction is still in-progress
+    TransactionInProgress,
+    /// Compaction was cancelled by the progress callback.
+    Cancelled,
+    /// Error from underlying storage
+    Storage(StorageError),
+}
+
+impl From<CompactionError> for Error {
+    fn from(err: CompactionError) -> Error {
+        match err {
+            CompactionError::PersistentSavepointExists => Error::PersistentSavepointExists,
+            CompactionError::EphemeralSavepointExists => Error::EphemeralSavepointExists,
+            CompactionError::TransactionInProgress => Error::TransactionInProgress,
+            CompactionError::Cancelled => Error::CompactionCancelled,
+            CompactionError::Storage(storage) => storage.into(),
+        }
+    }
+}
+
+impl From<StorageError> for CompactionError {
+    fn from(err: StorageError) -> CompactionError {
+        CompactionError::Storage(err)
+    }
+}
+
+impl Display for CompactionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CompactionError::PersistentSavepointExists => {
+                write!(
+                    f,
+                    "Persistent savepoint exists. Operation cannot be performed."
+                )
+            }
+            CompactionError::EphemeralSavepointExists => {
+                write!(
+                    f,
+                    "Ephemeral savepoint exists. Operation cannot be performed."
+                )
+            }
+            CompactionError::TransactionInProgress => {
+                write!(
+                    f,
+                    "A transaction is still in progress. Operation cannot be performed."
+                )
+            }
+            CompactionError::Cancelled => {
+                write!(f, "Compaction cancelled by progress callback")
+            }
+            CompactionError::Storage(storage) => storage.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CompactionError {}
+
+/// Errors related to transactions
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SetDurabilityError {
+    /// A persistent savepoint was modified
+    PersistentSavepointModified,
+}
+
+impl From<SetDurabilityError> for Error {
+    fn from(err: SetDurabilityError) -> Error {
+        match err {
+            SetDurabilityError::PersistentSavepointModified => Error::PersistentSavepointModified,
+        }
+    }
+}
+
+impl Display for SetDurabilityError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SetDurabilityError::PersistentSavepointModified => {
+                write!(
+                    f,
+                    "Persistent savepoint modified. Cannot reduce transaction durability"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SetDurabilityError {}
+
+/// Errors related to transactions
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TransactionError {
+    /// Error from underlying storage
+    Storage(StorageError),
+    /// The transaction is still referenced by a table or other object
+    ReadTransactionStillInUse(Box<ReadTransaction>),
+}
+
+impl TransactionError {
+    pub(crate) fn into_storage_error(self) -> StorageError {
+        match self {
+            TransactionError::Storage(storage) => storage,
+            _ => StorageError::Internal(String::from("unexpected non-storage transaction error")),
+        }
+    }
+}
+
+impl From<TransactionError> for Error {
+    fn from(err: TransactionError) -> Error {
+        match err {
+            TransactionError::Storage(storage) => storage.into(),
+            TransactionError::ReadTransactionStillInUse(txn) => {
+                Error::ReadTransactionStillInUse(txn)
+            }
+        }
+    }
+}
+
+impl From<StorageError> for TransactionError {
+    fn from(err: StorageError) -> TransactionError {
+        TransactionError::Storage(err)
+    }
+}
+
+impl Display for TransactionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TransactionError::Storage(storage) => storage.fmt(f),
+            TransactionError::ReadTransactionStillInUse(_) => {
+                write!(f, "Transaction still in use")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for TransactionError {}
+
+/// Errors related to committing transactions
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CommitError {
+    /// Error from underlying storage
+    Storage(StorageError),
+}
+
+impl CommitError {
+    pub(crate) fn into_storage_error(self) -> StorageError {
+        match self {
+            CommitError::Storage(storage) => storage,
+        }
+    }
+}
+
+impl From<CommitError> for Error {
+    fn from(err: CommitError) -> Error {
+        match err {
+            CommitError::Storage(storage) => storage.into(),
+        }
+    }
+}
+
+impl From<StorageError> for CommitError {
+    fn from(err: StorageError) -> CommitError {
+        CommitError::Storage(err)
+    }
+}
+
+impl Display for CommitError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CommitError::Storage(storage) => storage.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CommitError {}
+
+/// Superset of all other errors that can occur. Convenience enum so that users can convert all errors into a single type
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// The Database is already open. Cannot acquire lock.
+    DatabaseAlreadyOpen,
+    /// This savepoint is invalid or cannot be created.
+    ///
+    /// Savepoints become invalid when an older savepoint is restored after it was created,
+    /// and savepoints cannot be created if the transaction is "dirty" (any tables have been opened)
+    InvalidSavepoint,
+    /// [`crate::RepairSession::abort`] was called.
+    RepairAborted,
+    /// A persistent savepoint was modified
+    PersistentSavepointModified,
+    /// A persistent savepoint exists
+    PersistentSavepointExists,
+    /// An Ephemeral savepoint exists
+    EphemeralSavepointExists,
+    /// A transaction is still in-progress
+    TransactionInProgress,
+    /// The Database is corrupted
+    Corrupted(String),
+    /// An internal invariant was violated, indicating a bug in the database engine.
+    /// This is NOT caused by on-disk corruption -- it means the code has a logic error.
+    /// If you encounter this error, please file a bug report.
+    Internal(String),
+    /// The database file is in an old file format and must be manually upgraded
+    UpgradeRequired(u8),
+    /// The value being inserted exceeds the maximum of 3GiB
+    ValueTooLarge(usize),
+    /// A merge operator produced a value whose length does not match the
+    /// table's fixed-width value type. Writing it would store bytes that
+    /// cannot be deserialized back into the declared type.
+    MergeValueWidthMismatch {
+        /// The width the table's value type requires
+        expected: usize,
+        /// The length the merge operator returned
+        actual: usize,
+    },
+    /// Table types didn't match.
+    TableTypeMismatch {
+        table: String,
+        key: TypeName,
+        value: TypeName,
+    },
+    /// The table is a multimap table
+    TableIsMultimap(String),
+    /// The table is not a multimap table
+    TableIsNotMultimap(String),
+    TypeDefinitionChanged {
+        name: TypeName,
+        alignment: usize,
+        width: Option<usize>,
+    },
+    /// Table name does not match any table in database
+    TableDoesNotExist(String),
+    /// Table name already exists in the database
+    TableExists(String),
+    // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
+    // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
+    TableAlreadyOpen(String, &'static panic::Location<'static>),
+    /// A blob with the given sequence ID was not found in the blob store
+    BlobNotFound(u64),
+    /// Blob data checksum does not match the stored checksum
+    BlobChecksumMismatch {
+        /// Blob sequence number
+        sequence: u64,
+        /// Checksum stored in metadata
+        expected: u128,
+        /// Checksum computed from the blob data
+        actual: u128,
+    },
+    /// A streaming blob writer is already active on this transaction
+    BlobWriterActive,
+    /// The streaming blob writer has already been finished
+    BlobWriterFinished,
+    /// The requested byte range exceeds the blob's length
+    BlobRangeOutOfBounds {
+        /// Total blob length in bytes
+        blob_length: u64,
+        /// Requested range start offset
+        requested_offset: u64,
+        /// Requested range length
+        requested_length: u64,
+    },
+    /// The configured memory budget has been exceeded and the operation cannot proceed
+    MemoryBudgetExceeded {
+        /// The configured memory budget in bytes
+        budget: usize,
+        /// Current memory usage in bytes
+        used: usize,
+    },
+    /// The requested history snapshot was not found for the given transaction ID
+    HistorySnapshotNotFound(u64),
+    /// A B-tree page has an unexpected type byte
+    InvalidPageType {
+        page_region: u32,
+        page_index: u32,
+        page_order: u8,
+        found: u8,
+    },
+    /// A child pointer or checksum on a B-tree branch page is invalid
+    InvalidChildRef {
+        page_region: u32,
+        page_index: u32,
+        page_order: u8,
+        child_index: usize,
+        is_checksum: bool,
+    },
+    /// An entry index on a B-tree page is invalid or out of range
+    InvalidEntryIndex {
+        page_region: u32,
+        page_index: u32,
+        page_order: u8,
+        entry_index: usize,
+    },
+    /// A B-tree page has structural corruption
+    PageCorrupted {
+        page_region: u32,
+        page_index: u32,
+        page_order: u8,
+        detail: &'static str,
+    },
+    /// A CDC cursor position falls behind the retention window
+    CdcCursorBehindRetention {
+        /// The cursor position (transaction ID the consumer last processed)
+        cursor_txn_id: u64,
+        /// The oldest transaction ID still in the CDC log
+        oldest_retained_txn_id: u64,
+    },
+    /// A configuration parameter is invalid (e.g. page size, region size)
+    InvalidConfiguration {
+        /// Description of the invalid configuration
+        message: String,
+    },
+    /// The IVF-PQ index has not been trained yet
+    IndexNotTrained {
+        /// Name of the untrained index
+        index_name: String,
+    },
+    /// Vector dimensionality does not match the index configuration
+    DimensionMismatch {
+        /// Name of the index
+        index_name: String,
+        /// Dimension the index was configured with
+        expected: usize,
+        /// Dimension of the provided vector
+        actual: usize,
+    },
+    /// IVF-PQ index configuration is invalid
+    InvalidIndexConfig {
+        /// Description of the invalid configuration
+        detail: String,
+    },
+    /// On-disk format validation failed (magic number, version, layout, record structure)
+    FormatError {
+        /// Description of the format violation
+        detail: String,
+    },
+    /// Database requires recovery before this operation can proceed
+    RecoveryRequired,
+    /// Storage space exhausted; the allocator cannot grow further
+    OutOfSpace,
+    /// Timed out waiting for a write transaction lock (`no_std` spin-lock).
+    LockTimeout(String),
+    Io(BackendError),
+    DatabaseClosed,
+    /// A previous IO error occurred. The database must be closed and re-opened
+    PreviousIo,
+    LockPoisoned(&'static panic::Location<'static>),
+    /// The transaction is still referenced by a table or other object
+    ReadTransactionStillInUse(Box<ReadTransaction>),
+    /// A group commit batch was rolled back because a peer batch failed
+    #[cfg(feature = "std")]
+    GroupCommitPeerFailed,
+    /// The database group committer is shutting down
+    #[cfg(feature = "std")]
+    GroupCommitShutdown,
+    /// Blob compaction was cancelled by the progress callback.
+    CompactionCancelled,
+}
+
+#[cfg(feature = "std")]
+impl From<GroupCommitError> for Error {
+    fn from(err: GroupCommitError) -> Error {
+        match err {
+            GroupCommitError::BatchFailed(e) => e,
+            GroupCommitError::PeerFailed => Error::GroupCommitPeerFailed,
+            GroupCommitError::TransactionFailed(e) | GroupCommitError::CommitFailed(e) => e.into(),
+            GroupCommitError::Shutdown => Error::GroupCommitShutdown,
+            GroupCommitError::LockPoisoned => Error::LockPoisoned(panic::Location::caller()),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T> From<PoisonError<T>> for Error {
+    fn from(_: PoisonError<T>) -> Error {
+        Error::LockPoisoned(panic::Location::caller())
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Error {
+        Error::Io(BackendError::Io(err))
+    }
+}
+
+impl From<BackendError> for Error {
+    fn from(err: BackendError) -> Error {
+        Error::Io(err)
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Corrupted(msg) => {
+                write!(f, "DB corrupted: {msg}")
+            }
+            Error::Internal(msg) => {
+                write!(f, "Internal error (this is a bug): {msg}")
+            }
+            Error::UpgradeRequired(actual) => {
+                write!(
+                    f,
+                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION3}, but file is version {actual}"
+                )
+            }
+            Error::MergeValueWidthMismatch { expected, actual } => write!(
+                f,
+                "Merge operator returned {actual} bytes, but the table's value type requires exactly {expected}"
+            ),
+            Error::ValueTooLarge(len) => {
+                write!(
+                    f,
+                    "The value (length={len}) being inserted exceeds the maximum of {}GiB",
+                    MAX_VALUE_LENGTH / 1024 / 1024 / 1024
+                )
+            }
+            Error::TypeDefinitionChanged {
+                name,
+                alignment,
+                width,
+            } => {
+                write!(
+                    f,
+                    "Current definition of {} does not match stored definition (width={:?}, alignment={})",
+                    name.name(),
+                    width,
+                    alignment,
+                )
+            }
+            Error::TableTypeMismatch { table, key, value } => {
+                write!(
+                    f,
+                    "{table} is of type Table<{}, {}>",
+                    key.name(),
+                    value.name(),
+                )
+            }
+            Error::TableIsMultimap(table) => {
+                write!(f, "{table} is a multimap table")
+            }
+            Error::TableIsNotMultimap(table) => {
+                write!(f, "{table} is not a multimap table")
+            }
+            Error::TableDoesNotExist(table) => {
+                write!(f, "Table '{table}' does not exist")
+            }
+            Error::TableExists(table) => {
+                write!(f, "Table '{table}' already exists")
+            }
+            Error::TableAlreadyOpen(name, location) => {
+                write!(f, "Table '{name}' already opened at: {location}")
+            }
+            Error::BlobNotFound(seq) => {
+                write!(f, "Blob not found: sequence={seq}")
+            }
+            Error::BlobChecksumMismatch {
+                sequence,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Blob checksum mismatch: sequence={sequence}, expected={expected:#034x}, actual={actual:#034x}"
+                )
+            }
+            Error::BlobWriterActive => {
+                write!(
+                    f,
+                    "Cannot create blob writer or store blob while another writer is active"
+                )
+            }
+            Error::BlobWriterFinished => {
+                write!(f, "Blob writer has already been finished")
+            }
+            Error::BlobRangeOutOfBounds {
+                blob_length,
+                requested_offset,
+                requested_length,
+            } => {
+                write!(
+                    f,
+                    "Blob range out of bounds: blob_length={blob_length}, requested offset={requested_offset}, length={requested_length}"
+                )
+            }
+            Error::MemoryBudgetExceeded { budget, used } => {
+                write!(
+                    f,
+                    "Memory budget exceeded: budget={budget} bytes, used={used} bytes"
+                )
+            }
+            Error::HistorySnapshotNotFound(id) => {
+                write!(f, "History snapshot not found for transaction id={id}")
+            }
+            Error::InvalidPageType {
+                page_region,
+                page_index,
+                page_order,
+                found,
+            } => {
+                write!(
+                    f,
+                    "Invalid page type byte {found} on page ({page_region}, {page_index}, order={page_order}), expected LEAF (1) or BRANCH (2)"
+                )
+            }
+            Error::InvalidChildRef {
+                page_region,
+                page_index,
+                page_order,
+                child_index,
+                is_checksum,
+            } => {
+                let kind = if *is_checksum { "checksum" } else { "pointer" };
+                write!(
+                    f,
+                    "Invalid child {kind} at index {child_index} on page ({page_region}, {page_index}, order={page_order})"
+                )
+            }
+            Error::InvalidEntryIndex {
+                page_region,
+                page_index,
+                page_order,
+                entry_index,
+            } => {
+                write!(
+                    f,
+                    "Invalid entry index {entry_index} on page ({page_region}, {page_index}, order={page_order})"
+                )
+            }
+            Error::PageCorrupted {
+                page_region,
+                page_index,
+                page_order,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "Page ({page_region}, {page_index}, order={page_order}) corrupted: {detail}"
+                )
+            }
+            Error::CdcCursorBehindRetention {
+                cursor_txn_id,
+                oldest_retained_txn_id,
+            } => {
+                write!(
+                    f,
+                    "CDC cursor (txn_id={cursor_txn_id}) is behind the retention window (oldest retained txn_id={oldest_retained_txn_id})"
+                )
+            }
+            Error::InvalidConfiguration { message } => {
+                write!(f, "Invalid configuration: {message}")
+            }
+            Error::IndexNotTrained { index_name } => {
+                write!(f, "IVF-PQ index '{index_name}' has not been trained")
+            }
+            Error::DimensionMismatch {
+                index_name,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Dimension mismatch on index '{index_name}': expected {expected}, got {actual}"
+                )
+            }
+            Error::InvalidIndexConfig { detail } => {
+                write!(f, "Invalid index configuration: {detail}")
+            }
+            Error::FormatError { detail } => {
+                write!(f, "Format error: {detail}")
+            }
+            Error::RecoveryRequired => {
+                write!(
+                    f,
+                    "Database recovery required. Close and re-open the database."
+                )
+            }
+            Error::OutOfSpace => {
+                write!(f, "Storage space exhausted: allocator cannot grow further")
+            }
+            Error::LockTimeout(msg) => {
+                write!(f, "Lock timeout: {msg}")
+            }
+            Error::Io(err) => {
+                write!(f, "I/O error: {err}")
+            }
+            Error::DatabaseClosed => {
+                write!(f, "Database has been closed")
+            }
+            Error::PreviousIo => {
+                write!(
+                    f,
+                    "Previous I/O error occurred. Please close and re-open the database."
+                )
+            }
+            Error::LockPoisoned(location) => {
+                write!(f, "Poisoned internal lock: {location}")
+            }
+            Error::DatabaseAlreadyOpen => {
+                write!(f, "Database already open. Cannot acquire lock.")
+            }
+            Error::RepairAborted => {
+                write!(f, "Database repair aborted.")
+            }
+            Error::PersistentSavepointModified => {
+                write!(
+                    f,
+                    "Persistent savepoint modified. Cannot reduce transaction durability"
+                )
+            }
+            Error::PersistentSavepointExists => {
+                write!(
+                    f,
+                    "Persistent savepoint exists. Operation cannot be performed."
+                )
+            }
+            Error::EphemeralSavepointExists => {
+                write!(
+                    f,
+                    "Ephemeral savepoint exists. Operation cannot be performed."
+                )
+            }
+            Error::TransactionInProgress => {
+                write!(
+                    f,
+                    "A transaction is still in progress. Operation cannot be performed."
+                )
+            }
+            Error::InvalidSavepoint => {
+                write!(f, "Savepoint is invalid or cannot be created.")
+            }
+            Error::ReadTransactionStillInUse(_) => {
+                write!(f, "Transaction still in use")
+            }
+            #[cfg(feature = "std")]
+            Error::GroupCommitPeerFailed => {
+                write!(
+                    f,
+                    "Group commit batch rolled back: another batch in the group failed"
+                )
+            }
+            #[cfg(feature = "std")]
+            Error::GroupCommitShutdown => {
+                write!(f, "Group commit failed: database is shutting down")
+            }
+            Error::CompactionCancelled => {
+                write!(f, "Compaction cancelled by progress callback")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}

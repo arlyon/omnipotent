@@ -1,0 +1,16 @@
+[workspace]
+release = false
+git_tag_enable = false
+git_release_enable = false
+publish = false
+git_only = true
+release_always = false
+semver_check = false
+
+[[package]]
+name = "omnipotent-pack"
+release = true
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "omnipotent-pack-v{{ version }}"
+changelog_update = true

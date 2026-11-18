@@ -1,0 +1,17 @@
+[package]
+name = "omnipotent-embed"
+version = "0.1.0"
+description = "Pillar chunkers and FP32 EmbeddingGemma 2 inference"
+edition.workspace = true
+rust-version = "1.91"
+publish.workspace = true
+
+[features]
+default = []
+cuda = ["embeddinggemma2/cuda"]
+
+[dependencies]
+anyhow = "1"
+embeddinggemma2 = { git = "https://github.com/Dalailalama/embeddinggemma2-rust", rev = "ece9edc6ccbfd2593c40c179a32d3167ee94f04f", default-features = false }
+omnipotent-format = { path = "../omnipotent-format" }
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }

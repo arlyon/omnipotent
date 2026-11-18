@@ -1,0 +1,68 @@
+name: Packer binaries
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional existing omnipotent-pack-v tag to build and attach binaries to
+        type: string
+        default: ''
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  native:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'omnipotent-pack-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: linux-x86_64
+            args: ''
+          - runner: windows-2022
+            asset: windows-x86_64.exe
+            args: ''
+          - runner: macos-14
+            asset: macos-aarch64
+            args: --no-default-features
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+      ASSET: omnipotent-pack-${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # CUDA libraries are loaded at runtime on Linux/Windows; no toolkit is needed to build.
+      # Apple Silicon builds are CPU-only: embeddinggemma2-rust has no Metal backend.
+      - name: Test package and chunker behaviour
+        run: cargo test --locked --release -p omnipotent-pack -p omnipotent-embed -p omnipotent-wikipedia ${{ matrix.args }}
+      - name: Build executable
+        run: cargo build --locked --release -p omnipotent-pack ${{ matrix.args }}
+      - name: Stage executable and optionally attach to the release
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import os, pathlib, shutil, subprocess
+          binary = pathlib.Path('target/release/omnipotent-pack' + ('.exe' if os.name == 'nt' else ''))
+          subprocess.run([str(binary), '--help'], check=True)
+          asset = pathlib.Path(os.environ['ASSET'])
+          shutil.copy2(binary, asset)
+          tag = os.environ['RELEASE_TAG']
+          if tag:
+              assert tag.startswith('omnipotent-pack-v'), 'unexpected release tag'
+              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              tagged = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
+              assert head == tagged, 'release tag is not this commit'
+              subprocess.run(['gh', 'release', 'upload', tag, str(asset)], check=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: omnipotent-pack-${{ matrix.asset }}
+          path: omnipotent-pack-${{ matrix.asset }}

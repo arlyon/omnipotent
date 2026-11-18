@@ -1,0 +1,4854 @@
+use crate::blob_store::reader::BlobReader;
+use crate::blob_store::types::{
+    BLOB_CHUNK_SIZE, BlobChunkKey, BlobDedupConfig, BlobId, BlobMeta, BlobRef, BlobStats,
+    CausalEdge, CausalEdgeKey, CausalPath, ContentType, DedupStats, DedupVal, MAX_TAGS_PER_BLOB,
+    NamespaceKey, NamespaceVal, Sha256Key, StoreOptions, TagKey, TemporalKey,
+};
+use crate::blob_store::writer::BlobWriter;
+use crate::cdc::CdcConfig;
+use crate::cdc::types::{CdcEvent, CdcKey, CdcRecord, ChangeStream};
+use crate::compat::Arc;
+use crate::compat::{HashMap, HashSet, Mutex};
+use crate::db::TransactionGuard;
+use crate::error::CommitError;
+use crate::multimap_table::ReadOnlyUntypedMultimapTable;
+#[cfg_attr(target_has_atomic = "ptr", allow(unused_imports))]
+use crate::observer::DatabaseObserver;
+use crate::sealed::Sealed;
+use crate::table::ReadOnlyUntypedTable;
+use crate::temporal::HybridLogicalClock;
+use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
+use crate::tree_store::{
+    Btree, BtreeHeader, BtreeMut, InternalTableDefinition, MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page,
+    PageHint, PageListMut, PageNumber, PageTrackerPolicy, SerializedSavepoint, ShrinkPolicy,
+    TableTree, TableTreeMut, TableType, TransactionalMemory, hash64_with_seed, hash128_with_seed,
+};
+use crate::types::{Key, Value};
+use crate::{
+    AccessGuard, AccessGuardMutInPlace, ExtractIf, MultimapTable, MultimapTableDefinition,
+    MultimapTableHandle, MutInPlaceValue, Range, ReadOnlyMultimapTable, ReadOnlyTable, Result,
+    Savepoint, SavepointError, SetDurabilityError, StorageError, Table, TableDefinition,
+    TableError, TableHandle, TransactionError, TypeName, UntypedMultimapTableHandle,
+    UntypedTableHandle,
+};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::borrow::Borrow;
+use core::cmp::min;
+use core::fmt::{Debug, Display, Formatter};
+use core::marker::PhantomData;
+use core::mem;
+use core::mem::size_of;
+use core::ops::{RangeBounds, RangeFull};
+use core::panic;
+use core::sync::atomic::Ordering;
+#[cfg(feature = "logging")]
+use log::{debug, warn};
+use portable_atomic::AtomicBool;
+use sha2::{Digest, Sha256};
+
+const MAX_PAGES_PER_COMPACTION: usize = 1_000_000;
+
+fn xxh3_hash64(data: &[u8]) -> u64 {
+    hash64_with_seed(data, 0)
+}
+
+fn xxh3_hash128(data: &[u8]) -> u128 {
+    hash128_with_seed(data, 0)
+}
+const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
+    SystemTableDefinition::new("next_savepoint_id");
+pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
+    SystemTableDefinition::new("persistent_savepoints");
+// Pages that were allocated in the data tree by a given transaction. Only updated when a savepoint
+// exists
+pub(crate) const DATA_ALLOCATED_TABLE: SystemTableDefinition<
+    TransactionIdWithPagination,
+    PageList,
+> = SystemTableDefinition::new("data_pages_allocated");
+// Pages in the data tree that are in the pending free state: i.e., they are unreachable from the
+// root as of the given transaction.
+pub(crate) const DATA_FREED_TABLE: SystemTableDefinition<TransactionIdWithPagination, PageList> =
+    SystemTableDefinition::new("data_pages_unreachable");
+// Pages in the system tree that are in the pending free state: i.e., they are unreachable from the
+// root as of the given transaction.
+pub(crate) const SYSTEM_FREED_TABLE: SystemTableDefinition<TransactionIdWithPagination, PageList> =
+    SystemTableDefinition::new("system_pages_unreachable");
+// Blob store system tables
+const BLOB_TABLE: SystemTableDefinition<BlobId, BlobMeta> =
+    SystemTableDefinition::new("blob_store");
+const BLOB_TEMPORAL_INDEX: SystemTableDefinition<TemporalKey, ()> =
+    SystemTableDefinition::new("blob_temporal_idx");
+const BLOB_CAUSAL_CHILDREN: SystemTableDefinition<BlobId, BlobId> =
+    SystemTableDefinition::new("blob_causal_children");
+const BLOB_CAUSAL_EDGES: SystemTableDefinition<CausalEdgeKey, CausalEdge> =
+    SystemTableDefinition::new("blob_causal_edges_v2");
+const BLOB_TAG_INDEX: SystemTableDefinition<TagKey, ()> =
+    SystemTableDefinition::new("blob_tag_idx");
+const BLOB_NAMESPACE: SystemTableDefinition<BlobId, NamespaceVal> =
+    SystemTableDefinition::new("blob_namespace");
+const BLOB_NAMESPACE_INDEX: SystemTableDefinition<NamespaceKey, ()> =
+    SystemTableDefinition::new("blob_namespace_idx");
+const BLOB_DEDUP_INDEX: SystemTableDefinition<Sha256Key, DedupVal> =
+    SystemTableDefinition::new("blob_dedup_idx");
+const BLOB_DEDUP_MAP: SystemTableDefinition<BlobId, Sha256Key> =
+    SystemTableDefinition::new("blob_dedup_map");
+/// Cap for buffer reservations driven by a length read off disk.
+///
+/// Blob lengths come from `BlobRef.length` in a B-tree value. Reserving on an
+/// unvalidated length lets a corrupted value request an enormous allocation,
+/// and allocation failure in Rust **aborts** the process -- it does not unwind,
+/// so no caller can turn it into an error. Reserve at most this much up front
+/// and let the buffer grow as chunks actually arrive; the post-assembly length
+/// check still rejects a length that disagrees with the data.
+const MAX_BLOB_PREALLOC: u64 = 64 * 1024 * 1024;
+
+/// Reservation size to use for a blob buffer of `expected_length` bytes.
+#[allow(clippy::cast_possible_truncation)]
+fn blob_prealloc(expected_length: u64) -> usize {
+    // The min() bounds this well below usize::MAX on 32-bit targets too.
+    expected_length.min(MAX_BLOB_PREALLOC) as usize
+}
+
+/// Chunked blob data storage: blob data is split into BLOB_CHUNK_SIZE-byte
+/// chunks and stored in this B-tree table. This gives blob data full MVCC
+/// semantics via the page store's copy-on-write mechanism.
+const BLOB_CHUNKS: SystemTableDefinition<BlobChunkKey, &[u8]> =
+    SystemTableDefinition::new("blob_chunks");
+/// Monotonic counters for blob store. Key 0 = next blob sequence number,
+/// Key 1 = HLC state. Replaces the header-embedded `BlobCommitState`.
+const BLOB_COUNTERS: SystemTableDefinition<u64, u64> = SystemTableDefinition::new("blob_counters");
+const BLOB_COUNTER_NEXT_SEQ: u64 = 0;
+const BLOB_COUNTER_HLC: u64 = 1;
+const CDC_LOG_TABLE: SystemTableDefinition<CdcKey, CdcRecord> =
+    SystemTableDefinition::new("cdc_log");
+const CDC_CURSOR_TABLE: SystemTableDefinition<&str, u64> =
+    SystemTableDefinition::new("cdc_cursors");
+const HISTORY_TABLE: SystemTableDefinition<u64, HistorySnapshot> =
+    SystemTableDefinition::new("transaction_history");
+// ---------------------------------------------------------------------------
+// HistorySnapshot -- fixed-width Value for time-travel history table
+// ---------------------------------------------------------------------------
+
+/// Fixed-width snapshot of a committed transaction's state, stored in the
+/// `transaction_history` system table for time-travel reads.
+///
+/// Binary layout (73 bytes):
+/// ```text
+/// [user_root_non_null: u8]           offset 0
+/// [user_root: 32 bytes BtreeHeader]  offset 1   (PageNumber[8] + Checksum[16] + length[8])
+/// [timestamp_ms: u64 LE]             offset 33
+/// [blob_region_offset: u64 LE]       offset 41
+/// [blob_region_length: u64 LE]       offset 49
+/// [blob_next_sequence: u64 LE]       offset 57
+/// [blob_hlc_state: u64 LE]           offset 65
+/// ```
+#[derive(Debug, Clone)]
+pub(crate) struct HistorySnapshot {
+    data: [u8; Self::SIZE],
+}
+
+impl HistorySnapshot {
+    const SIZE: usize = 1 + BtreeHeader::serialized_size() + 5 * size_of::<u64>();
+
+    const USER_ROOT_FLAG: usize = 0;
+    const USER_ROOT: usize = 1;
+    const TIMESTAMP: usize = 1 + BtreeHeader::serialized_size();
+    const BLOB_OFFSET: usize = Self::TIMESTAMP + size_of::<u64>();
+    const BLOB_LENGTH: usize = Self::BLOB_OFFSET + size_of::<u64>();
+    const BLOB_SEQUENCE: usize = Self::BLOB_LENGTH + size_of::<u64>();
+    const BLOB_HLC: usize = Self::BLOB_SEQUENCE + size_of::<u64>();
+
+    const USER_ROOT_END: usize = Self::USER_ROOT + BtreeHeader::serialized_size();
+
+    pub(crate) fn new(
+        user_root: Option<BtreeHeader>,
+        timestamp_ms: u64,
+        blob_region_offset: u64,
+        blob_region_length: u64,
+        blob_next_sequence: u64,
+        blob_hlc_state: u64,
+    ) -> Self {
+        let mut data = [0u8; Self::SIZE];
+        if let Some(root) = user_root {
+            data[Self::USER_ROOT_FLAG] = 1;
+            data[Self::USER_ROOT..Self::USER_ROOT_END].copy_from_slice(&root.to_le_bytes());
+        }
+        data[Self::TIMESTAMP..Self::TIMESTAMP + 8].copy_from_slice(&timestamp_ms.to_le_bytes());
+        data[Self::BLOB_OFFSET..Self::BLOB_OFFSET + 8]
+            .copy_from_slice(&blob_region_offset.to_le_bytes());
+        data[Self::BLOB_LENGTH..Self::BLOB_LENGTH + 8]
+            .copy_from_slice(&blob_region_length.to_le_bytes());
+        data[Self::BLOB_SEQUENCE..Self::BLOB_SEQUENCE + 8]
+            .copy_from_slice(&blob_next_sequence.to_le_bytes());
+        data[Self::BLOB_HLC..Self::BLOB_HLC + 8].copy_from_slice(&blob_hlc_state.to_le_bytes());
+        Self { data }
+    }
+
+    pub(crate) fn user_root(&self) -> Option<BtreeHeader> {
+        if self.data[Self::USER_ROOT_FLAG] != 0 {
+            self.data[Self::USER_ROOT..Self::USER_ROOT_END]
+                .try_into()
+                .ok()
+                .map(BtreeHeader::from_le_bytes)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn timestamp_ms(&self) -> u64 {
+        self.data[Self::TIMESTAMP..Self::TIMESTAMP + 8]
+            .try_into()
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    }
+}
+
+impl Value for HistorySnapshot {
+    type SelfType<'a>
+        = HistorySnapshot
+    where
+        Self: 'a;
+    type AsBytes<'a>
+        = [u8; HistorySnapshot::SIZE]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(Self::SIZE)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        let mut buf = [0u8; Self::SIZE];
+        buf.copy_from_slice(&data[..Self::SIZE]);
+        Self { data: buf }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b,
+    {
+        value.data
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal("redb::HistorySnapshot")
+    }
+}
+
+// The allocator state table is stored in the system table tree, but it's accessed using
+// raw btree operations rather than open_system_table(), so there's no SystemTableDefinition
+pub(crate) const ALLOCATOR_STATE_TABLE_NAME: &str = "allocator_state";
+pub(crate) type AllocatorStateTree = Btree<AllocatorStateKey, &'static [u8]>;
+pub(crate) type AllocatorStateTreeMut<'a> = BtreeMut<'a, AllocatorStateKey, &'static [u8]>;
+pub(crate) type SystemFreedTree<'a> = BtreeMut<'a, TransactionIdWithPagination, PageList<'static>>;
+
+// Format:
+// 2 bytes: length
+// length * size_of(PageNumber): array of page numbers
+#[derive(Debug)]
+pub(crate) struct PageList<'a> {
+    data: &'a [u8],
+}
+
+impl PageList<'_> {
+    fn required_bytes(len: usize) -> usize {
+        2 + PageNumber::serialized_size() * len
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        let stored = self.data[..size_of::<u16>()]
+            .try_into()
+            .map(|b| u16::from_le_bytes(b) as usize)
+            .unwrap_or(0);
+        // The count is read off a B-tree page, so it can disagree with the
+        // buffer that follows it. Clamp it, otherwise `get` slices out of
+        // bounds and panics. This is walked by `visit_freed_tree` during
+        // repair, on a database already known to be damaged.
+        let capacity =
+            self.data.len().saturating_sub(size_of::<u16>()) / PageNumber::serialized_size();
+        stored.min(capacity)
+    }
+
+    pub(crate) fn get(&self, index: usize) -> PageNumber {
+        let start = size_of::<u16>() + PageNumber::serialized_size() * index;
+        self.data
+            .get(start..(start + PageNumber::serialized_size()))
+            .and_then(|b| b.try_into().ok())
+            .map_or(PageNumber::new(0, 0, 0), PageNumber::from_le_bytes)
+    }
+}
+
+impl Value for PageList<'_> {
+    type SelfType<'a>
+        = PageList<'a>
+    where
+        Self: 'a;
+    type AsBytes<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        PageList { data }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> &'b [u8]
+    where
+        Self: 'b,
+    {
+        value.data
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal("redb::PageList")
+    }
+}
+
+impl MutInPlaceValue for PageList<'_> {
+    type BaseRefType = PageListMut;
+
+    fn initialize(data: &mut [u8]) {
+        debug_assert!(data.len() >= 8);
+        // Set the length to zero
+        if data.len() >= 8 {
+            data[..8].fill(0);
+        }
+    }
+
+    fn from_bytes_mut(data: &mut [u8]) -> &mut Self::BaseRefType {
+        // SAFETY: PageListMut is #[repr(transparent)] over [u8], so it has the
+        // same size, alignment, and memory layout. The pointer cast preserves
+        // the slice length metadata and the mutable borrow guarantees exclusive
+        // access for the lifetime of the returned reference.
+        unsafe { &mut *(core::ptr::from_mut::<[u8]>(data) as *mut PageListMut) }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TransactionIdWithPagination {
+    pub(crate) transaction_id: u64,
+    pub(crate) pagination_id: u64,
+}
+
+impl Value for TransactionIdWithPagination {
+    type SelfType<'a>
+        = TransactionIdWithPagination
+    where
+        Self: 'a;
+    type AsBytes<'a>
+        = [u8; 2 * size_of::<u64>()]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(2 * size_of::<u64>())
+    }
+
+    #[allow(clippy::big_endian_bytes)]
+    fn from_bytes<'a>(data: &'a [u8]) -> Self
+    where
+        Self: 'a,
+    {
+        let transaction_id = data[..size_of::<u64>()]
+            .try_into()
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        let pagination_id = data[size_of::<u64>()..]
+            .try_into()
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        Self {
+            transaction_id,
+            pagination_id,
+        }
+    }
+
+    #[allow(clippy::big_endian_bytes)]
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> [u8; 2 * size_of::<u64>()]
+    where
+        Self: 'b,
+    {
+        let mut result = [0u8; 2 * size_of::<u64>()];
+        result[..size_of::<u64>()].copy_from_slice(&value.transaction_id.to_be_bytes());
+        result[size_of::<u64>()..].copy_from_slice(&value.pagination_id.to_be_bytes());
+        result
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal("redb::TransactionIdWithPagination")
+    }
+}
+
+impl Key for TransactionIdWithPagination {
+    fn compare(data1: &[u8], data2: &[u8]) -> core::cmp::Ordering {
+        // Big-endian serialization means raw byte comparison is correct.
+        let len = (2 * size_of::<u64>()).min(data1.len()).min(data2.len());
+        data1[..len]
+            .cmp(&data2[..len])
+            .then_with(|| data1.len().cmp(&data2.len()))
+    }
+}
+
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
+pub(crate) enum AllocatorStateKey {
+    Deprecated,
+    Region(u32),
+    RegionTracker,
+    TransactionId,
+}
+
+impl Value for AllocatorStateKey {
+    type SelfType<'a> = Self;
+    type AsBytes<'a> = [u8; 1 + size_of::<u32>()];
+
+    fn fixed_width() -> Option<usize> {
+        Some(1 + size_of::<u32>())
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        // `first()` rather than `data[0]`: an empty slice panicked here with
+        // "index out of bounds: the len is 0 but the index is 0". The
+        // discriminant arm below already degrades rather than panics, so the
+        // length check was the only gap.
+        match data.first() {
+            Some(3) => Self::Region(data[1..].try_into().map(u32::from_le_bytes).unwrap_or(0)),
+            Some(4) => Self::RegionTracker,
+            Some(5) => Self::TransactionId,
+            // 0, 1, 2 were used in redb 2.x; unknown discriminants, and an
+            // empty slice, are treated as deprecated to avoid panicking on
+            // corrupt data.
+            _ => Self::Deprecated,
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        let mut result = Self::AsBytes::default();
+        match value {
+            Self::Region(region) => {
+                result[0] = 3;
+                result[1..].copy_from_slice(&u32::to_le_bytes(*region));
+            }
+            Self::RegionTracker => {
+                result[0] = 4;
+            }
+            Self::TransactionId => {
+                result[0] = 5;
+            }
+            AllocatorStateKey::Deprecated => {
+                result[0] = 0;
+            }
+        }
+
+        result
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal("redb::AllocatorStateKey")
+    }
+}
+
+impl Key for AllocatorStateKey {
+    fn compare(data1: &[u8], data2: &[u8]) -> core::cmp::Ordering {
+        Self::from_bytes(data1).cmp(&Self::from_bytes(data2))
+    }
+}
+
+pub struct SystemTableDefinition<'a, K: Key + 'static, V: Value + 'static> {
+    name: &'a str,
+    _key_type: PhantomData<K>,
+    _value_type: PhantomData<V>,
+}
+
+impl<'a, K: Key + 'static, V: Value + 'static> SystemTableDefinition<'a, K, V> {
+    pub const fn new(name: &'a str) -> Self {
+        assert!(!name.is_empty());
+        Self {
+            name,
+            _key_type: PhantomData,
+            _value_type: PhantomData,
+        }
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> TableHandle for SystemTableDefinition<'_, K, V> {
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+impl<K: Key, V: Value> Sealed for SystemTableDefinition<'_, K, V> {}
+
+impl<K: Key + 'static, V: Value + 'static> Clone for SystemTableDefinition<'_, K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> Copy for SystemTableDefinition<'_, K, V> {}
+
+impl<K: Key + 'static, V: Value + 'static> Display for SystemTableDefinition<'_, K, V> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{}<{}, {}>",
+            self.name,
+            K::type_name().name(),
+            V::type_name().name()
+        )
+    }
+}
+
+/// Informational storage stats about the database
+#[derive(Debug, Clone, Copy)]
+pub struct DatabaseStats {
+    pub(crate) tree_height: u32,
+    pub(crate) allocated_pages: u64,
+    pub(crate) free_pages: u64,
+    pub(crate) trailing_free_pages: u64,
+    pub(crate) leaf_pages: u64,
+    pub(crate) branch_pages: u64,
+    pub(crate) stored_leaf_bytes: u64,
+    pub(crate) metadata_bytes: u64,
+    pub(crate) fragmented_bytes: u64,
+    pub(crate) page_size: usize,
+}
+
+impl DatabaseStats {
+    /// Maximum traversal distance to reach the deepest (key, value) pair, across all tables
+    pub fn tree_height(&self) -> u32 {
+        self.tree_height
+    }
+
+    /// Number of pages allocated
+    pub fn allocated_pages(&self) -> u64 {
+        self.allocated_pages
+    }
+
+    /// Number of pages currently free in the buddy allocator, available for immediate reuse
+    pub fn free_pages(&self) -> u64 {
+        self.free_pages
+    }
+
+    /// Number of contiguous free pages at the end of the database file.
+    /// These can be reclaimed by compaction to shrink the file.
+    pub fn trailing_free_pages(&self) -> u64 {
+        self.trailing_free_pages
+    }
+
+    /// Number of leaf pages that store user data
+    pub fn leaf_pages(&self) -> u64 {
+        self.leaf_pages
+    }
+
+    /// Number of branch pages in btrees that store user data
+    pub fn branch_pages(&self) -> u64 {
+        self.branch_pages
+    }
+
+    /// Number of bytes consumed by keys and values that have been inserted.
+    /// Does not include indexing overhead
+    pub fn stored_bytes(&self) -> u64 {
+        self.stored_leaf_bytes
+    }
+
+    /// Number of bytes consumed by keys in internal branch pages, plus other metadata
+    pub fn metadata_bytes(&self) -> u64 {
+        self.metadata_bytes
+    }
+
+    /// Number of bytes consumed by fragmentation, both in data pages and internal metadata tables
+    pub fn fragmented_bytes(&self) -> u64 {
+        self.fragmented_bytes
+    }
+
+    /// Number of bytes per page
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+#[non_exhaustive]
+pub enum Durability {
+    /// Commits with this durability level will not be persisted to disk unless followed by a
+    /// commit with [`Durability::Immediate`].
+    None,
+    /// Commits with this durability level are guaranteed to be persistent as soon as
+    /// [`WriteTransaction::commit`] returns.
+    Immediate,
+}
+
+// These are the actual durability levels used internally. `Durability::Paranoid` is translated
+// to `InternalDurability::Immediate`, and also enables 2-phase commit
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InternalDurability {
+    None,
+    Immediate,
+}
+
+// Like a Table but only one may be open at a time to avoid possible races
+pub struct SystemTable<'db, 's, K: Key + 'static, V: Value + 'static> {
+    name: String,
+    namespace: &'s mut SystemNamespace<'db>,
+    tree: BtreeMut<'s, K, V>,
+    transaction_guard: Arc<TransactionGuard>,
+}
+
+impl<'db, 's, K: Key + 'static, V: Value + 'static> SystemTable<'db, 's, K, V> {
+    fn new(
+        name: &str,
+        table_root: Option<BtreeHeader>,
+        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+        namespace: &'s mut SystemNamespace<'db>,
+    ) -> SystemTable<'db, 's, K, V> {
+        // No need to track allocations in the system tree. Savepoint restoration only relies on
+        // freeing in the data tree
+        let ignore = Arc::new(Mutex::new(PageTrackerPolicy::Ignore));
+        SystemTable {
+            name: name.to_string(),
+            namespace,
+            tree: BtreeMut::new_uncompressed(table_root, guard.clone(), mem, freed_pages, ignore),
+            transaction_guard: guard,
+        }
+    }
+
+    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<'_, V>>>
+    where
+        K: 'a,
+    {
+        self.tree.get(key.borrow())
+    }
+
+    fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<'_, K, V>>
+    where
+        K: 'a,
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        self.tree
+            .range(&range)
+            .map(|x| Range::new(x, self.transaction_guard.clone()))
+    }
+
+    pub fn extract_from_if<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
+        &mut self,
+        range: impl RangeBounds<KR> + 'a,
+        predicate: F,
+    ) -> Result<ExtractIf<'_, K, V, F>>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        self.tree
+            .extract_from_if(&range, predicate)
+            .map(ExtractIf::new)
+    }
+
+    pub fn insert<'k, 'v>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+        value: impl Borrow<V::SelfType<'v>>,
+    ) -> Result<Option<AccessGuard<'_, V>>> {
+        let value_len = V::as_bytes(value.borrow()).as_ref().len();
+        if value_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_len));
+        }
+        let key_len = K::as_bytes(key.borrow()).as_ref().len();
+        if key_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(key_len));
+        }
+        if value_len + key_len > MAX_PAIR_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_len + key_len));
+        }
+        self.tree.insert(key.borrow(), value.borrow())
+    }
+
+    pub fn remove<'a>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'a>>,
+    ) -> Result<Option<AccessGuard<'_, V>>>
+    where
+        K: 'a,
+    {
+        self.tree.remove(key.borrow())
+    }
+}
+
+impl<K: Key + 'static, V: MutInPlaceValue + 'static> SystemTable<'_, '_, K, V> {
+    pub fn insert_reserve<'a>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'a>>,
+        value_length: usize,
+    ) -> Result<AccessGuardMutInPlace<'_, V>> {
+        if value_length > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_length));
+        }
+        let key_len = K::as_bytes(key.borrow()).as_ref().len();
+        if key_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(key_len));
+        }
+        if value_length + key_len > MAX_PAIR_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_length + key_len));
+        }
+        self.tree.insert_reserve(key.borrow(), value_length)
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> Drop for SystemTable<'_, '_, K, V> {
+    fn drop(&mut self) {
+        self.namespace.close_table(
+            &self.name,
+            &self.tree,
+            self.tree.get_root().map(|x| x.length).unwrap_or_default(),
+        );
+    }
+}
+
+struct SystemNamespace<'db> {
+    table_tree: TableTreeMut<'db>,
+    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+    transaction_guard: Arc<TransactionGuard>,
+}
+
+impl<'db> SystemNamespace<'db> {
+    fn new(
+        root_page: Option<BtreeHeader>,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Self {
+        // No need to track allocations in the system tree. Savepoint restoration only relies on
+        // freeing in the data tree
+        let ignore = Arc::new(Mutex::new(PageTrackerPolicy::Ignore));
+        let freed_pages = Arc::new(Mutex::new(vec![]));
+        Self {
+            table_tree: TableTreeMut::new(
+                root_page,
+                guard.clone(),
+                mem,
+                freed_pages.clone(),
+                ignore,
+            ),
+            freed_pages,
+            transaction_guard: guard.clone(),
+        }
+    }
+
+    fn system_freed_pages(&self) -> Arc<Mutex<Vec<PageNumber>>> {
+        self.freed_pages.clone()
+    }
+
+    fn open_system_table<'txn, 's, K: Key + 'static, V: Value + 'static>(
+        &'s mut self,
+        transaction: &'txn WriteTransaction,
+        definition: SystemTableDefinition<K, V>,
+    ) -> Result<SystemTable<'db, 's, K, V>> {
+        let (root, _) = self
+            .table_tree
+            .get_or_create_table::<K, V>(definition.name(), TableType::Normal)
+            .map_err(|e| {
+                e.into_storage_error_or_internal("Internal error. System table is corrupted")
+            })?;
+        transaction.dirty.store(true, Ordering::Release);
+
+        Ok(SystemTable::new(
+            definition.name(),
+            root,
+            self.freed_pages.clone(),
+            self.transaction_guard.clone(),
+            transaction.mem.clone(),
+            self,
+        ))
+    }
+
+    fn close_table<K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        name: &str,
+        table: &BtreeMut<K, V>,
+        length: u64,
+    ) {
+        self.table_tree
+            .stage_update_table_root(name, table.get_root(), length);
+    }
+}
+
+struct TableNamespace<'db> {
+    open_tables: HashMap<String, &'static panic::Location<'static>>,
+    allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
+    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+    table_tree: TableTreeMut<'db>,
+}
+
+impl TableNamespace<'_> {
+    fn new(
+        root_page: Option<BtreeHeader>,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Self {
+        let allocated = Arc::new(Mutex::new(PageTrackerPolicy::new_tracking()));
+        let freed_pages = Arc::new(Mutex::new(vec![]));
+        let table_tree = TableTreeMut::new(
+            root_page,
+            guard,
+            mem,
+            // Committed pages which are no longer reachable and will be queued for free'ing
+            // These are separated from the system freed pages
+            freed_pages.clone(),
+            allocated.clone(),
+        );
+        Self {
+            open_tables: Default::default(),
+            table_tree,
+            freed_pages,
+            allocated_pages: allocated,
+        }
+    }
+
+    fn set_dirty(&mut self, transaction: &WriteTransaction) {
+        transaction.dirty.store(true, Ordering::Release);
+        if !transaction
+            .transaction_tracker
+            .any_savepoint_exists()
+            .unwrap_or(true)
+        {
+            // No savepoints exist, and we don't allow savepoints to be created in a dirty transaction
+            // so we can disable allocation tracking now
+            *self.allocated_pages.lock() = PageTrackerPolicy::Ignore;
+        }
+    }
+
+    fn set_root(&mut self, root: Option<BtreeHeader>) -> Result<(), StorageError> {
+        if !self.open_tables.is_empty() {
+            return Err(StorageError::Internal(
+                "set_root called with open tables".into(),
+            ));
+        }
+        // Clear pending table root updates accumulated by close_table() calls
+        // that occurred after the savepoint was taken. Without this, commit()
+        // would re-stage post-savepoint roots into the restored tree, producing
+        // a mix of pre- and post-savepoint state.
+        self.table_tree.clear_pending_updates();
+        self.table_tree.set_root(root);
+        Ok(())
+    }
+
+    #[track_caller]
+    fn inner_open<K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        name: &str,
+        table_type: TableType,
+    ) -> Result<(Option<BtreeHeader>, u64), TableError> {
+        if let Some(location) = self.open_tables.get(name) {
+            return Err(TableError::TableAlreadyOpen(name.to_string(), location));
+        }
+
+        let root = self
+            .table_tree
+            .get_or_create_table::<K, V>(name, table_type)?;
+        self.open_tables
+            .insert(name.to_string(), panic::Location::caller());
+
+        Ok(root)
+    }
+
+    #[track_caller]
+    pub fn open_multimap_table<'txn, K: Key + 'static, V: Key + 'static>(
+        &mut self,
+        transaction: &'txn WriteTransaction,
+        definition: MultimapTableDefinition<K, V>,
+    ) -> Result<MultimapTable<'txn, K, V>, TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Opening multimap table: {definition}");
+        let (root, length) = self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
+        self.set_dirty(transaction);
+
+        Ok(MultimapTable::new(
+            definition.name(),
+            root,
+            length,
+            self.freed_pages.clone(),
+            self.allocated_pages.clone(),
+            transaction.mem.clone(),
+            transaction,
+        ))
+    }
+
+    #[track_caller]
+    pub fn open_table<'txn, K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        transaction: &'txn WriteTransaction,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Table<'txn, K, V>, TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Opening table: {definition}");
+        let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
+        self.set_dirty(transaction);
+
+        Ok(Table::new(
+            definition.name(),
+            root,
+            self.freed_pages.clone(),
+            self.allocated_pages.clone(),
+            transaction.mem.clone(),
+            transaction,
+        ))
+    }
+
+    #[track_caller]
+    fn inner_rename(
+        &mut self,
+        name: &str,
+        new_name: &str,
+        table_type: TableType,
+    ) -> Result<(), TableError> {
+        if let Some(location) = self.open_tables.get(name) {
+            return Err(TableError::TableAlreadyOpen(name.to_string(), location));
+        }
+
+        self.table_tree.rename_table(name, new_name, table_type)
+    }
+
+    #[track_caller]
+    fn rename_table(
+        &mut self,
+        transaction: &WriteTransaction,
+        name: &str,
+        new_name: &str,
+    ) -> Result<(), TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Renaming table: {name} to {new_name}");
+        self.set_dirty(transaction);
+        self.inner_rename(name, new_name, TableType::Normal)
+    }
+
+    #[track_caller]
+    fn rename_multimap_table(
+        &mut self,
+        transaction: &WriteTransaction,
+        name: &str,
+        new_name: &str,
+    ) -> Result<(), TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Renaming multimap table: {name} to {new_name}");
+        self.set_dirty(transaction);
+        self.inner_rename(name, new_name, TableType::Multimap)
+    }
+
+    #[track_caller]
+    fn inner_delete(&mut self, name: &str, table_type: TableType) -> Result<bool, TableError> {
+        if let Some(location) = self.open_tables.get(name) {
+            return Err(TableError::TableAlreadyOpen(name.to_string(), location));
+        }
+
+        self.table_tree.delete_table(name, table_type)
+    }
+
+    #[track_caller]
+    fn delete_table(
+        &mut self,
+        transaction: &WriteTransaction,
+        name: &str,
+    ) -> Result<bool, TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Deleting table: {name}");
+        self.set_dirty(transaction);
+        self.inner_delete(name, TableType::Normal)
+    }
+
+    #[track_caller]
+    fn delete_multimap_table(
+        &mut self,
+        transaction: &WriteTransaction,
+        name: &str,
+    ) -> Result<bool, TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Deleting multimap table: {name}");
+        self.set_dirty(transaction);
+        self.inner_delete(name, TableType::Multimap)
+    }
+
+    pub(crate) fn close_table<K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        name: &str,
+        table: &BtreeMut<K, V>,
+        length: u64,
+    ) {
+        // Table should always be present when closing, but gracefully handle the case
+        // where it is not to avoid panicking in production
+        let _ = self.open_tables.remove(name);
+        self.table_tree
+            .stage_update_table_root(name, table.get_root(), length);
+    }
+}
+
+/// A read/write transaction
+///
+/// Only a single [`WriteTransaction`] may exist at a time
+pub struct WriteTransaction {
+    transaction_tracker: Arc<TransactionTracker>,
+    mem: Arc<TransactionalMemory>,
+    transaction_guard: Arc<TransactionGuard>,
+    transaction_id: TransactionId,
+    tables: Mutex<TableNamespace<'static>>,
+    system_tables: Mutex<SystemNamespace<'static>>,
+    completed: bool,
+    dirty: AtomicBool,
+    durability: InternalDurability,
+    two_phase_commit: bool,
+    shrink_policy: ShrinkPolicy,
+    quick_repair: bool,
+    // Persistent savepoints created during this transaction
+    created_persistent_savepoints: Mutex<HashSet<SavepointId>>,
+    deleted_persistent_savepoints: Mutex<Vec<(SavepointId, TransactionId)>>,
+    // Guard: true while a BlobWriter is active, preventing concurrent blob ops
+    blob_writer_active: AtomicBool,
+    // Content-addressable blob dedup configuration
+    blob_dedup_config: BlobDedupConfig,
+    // CDC: in-memory change log, Some when CDC enabled
+    pub(crate) cdc_log: Option<Mutex<Vec<CdcEvent>>>,
+    cdc_config: CdcConfig,
+    history_retention: u64,
+    observer: crate::observer::ObserverRef,
+    #[cfg(feature = "metrics")]
+    db_metrics: Arc<crate::observer::DbMetrics>,
+}
+
+impl WriteTransaction {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        guard: TransactionGuard,
+        transaction_tracker: Arc<TransactionTracker>,
+        mem: Arc<TransactionalMemory>,
+        blob_dedup_config: BlobDedupConfig,
+        cdc_config: CdcConfig,
+        history_retention: u64,
+        observer: crate::observer::ObserverRef,
+        #[cfg(feature = "metrics")] db_metrics: Arc<crate::observer::DbMetrics>,
+    ) -> Result<Self> {
+        let transaction_id = guard.id()?;
+        let guard = Arc::new(guard);
+
+        let root_page = mem.get_data_root();
+        let system_page = mem.get_system_root();
+
+        let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
+        let system_tables = SystemNamespace::new(system_page, guard.clone(), mem.clone());
+
+        Ok(Self {
+            transaction_tracker,
+            mem: mem.clone(),
+            transaction_guard: guard.clone(),
+            transaction_id,
+            tables: Mutex::new(tables),
+            system_tables: Mutex::new(system_tables),
+            completed: false,
+            dirty: AtomicBool::new(false),
+            durability: InternalDurability::Immediate,
+            two_phase_commit: false,
+            quick_repair: false,
+            shrink_policy: ShrinkPolicy::Default,
+            created_persistent_savepoints: Mutex::new(Default::default()),
+            deleted_persistent_savepoints: Mutex::new(vec![]),
+            blob_writer_active: AtomicBool::new(false),
+            blob_dedup_config,
+            cdc_log: if cdc_config.enabled {
+                Some(Mutex::new(Vec::new()))
+            } else {
+                None
+            },
+            cdc_config,
+            history_retention,
+            observer,
+            #[cfg(feature = "metrics")]
+            db_metrics,
+        })
+    }
+
+    /// Record a CDC event. No-op when CDC is disabled.
+    pub(crate) fn record_cdc(&self, event: CdcEvent) {
+        if let Some(ref log) = self.cdc_log {
+            log.lock().push(event);
+        }
+    }
+
+    pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
+        self.shrink_policy = shrink_policy;
+    }
+
+    pub(crate) fn pending_free_pages(&self) -> Result<bool> {
+        let mut system_tables = self.system_tables.lock();
+        if system_tables
+            .open_system_table(self, DATA_FREED_TABLE)?
+            .tree
+            .get_root()
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if system_tables
+            .open_system_table(self, SYSTEM_FREED_TABLE)?
+            .tree
+            .get_root()
+            .is_some()
+        {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    #[cfg(all(debug_assertions, feature = "std"))]
+    pub fn print_allocated_page_debug(&self) {
+        let mut all_allocated: HashSet<PageNumber> =
+            HashSet::from_iter(self.mem.all_allocated_pages());
+
+        self.mem.debug_check_allocator_consistency();
+
+        let mut table_pages = vec![];
+        self.tables
+            .lock()
+            .table_tree
+            .visit_all_pages(|path| {
+                table_pages.push(path.page_number());
+                Ok(())
+            })
+            .unwrap();
+        println!("Tables");
+        for p in table_pages {
+            assert!(all_allocated.remove(&p));
+            println!("{p:?}");
+        }
+
+        let mut system_table_pages = vec![];
+        self.system_tables
+            .lock()
+            .table_tree
+            .visit_all_pages(|path| {
+                system_table_pages.push(path.page_number());
+                Ok(())
+            })
+            .unwrap();
+        println!("System tables");
+        for p in system_table_pages {
+            assert!(all_allocated.remove(&p));
+            println!("{p:?}");
+        }
+
+        {
+            println!("Pending free (in data freed table)");
+            let mut system_tables = self.system_tables.lock();
+            let data_freed = system_tables
+                .open_system_table(self, DATA_FREED_TABLE)
+                .unwrap();
+            for entry in data_freed.range::<TransactionIdWithPagination>(..).unwrap() {
+                let (_, entry) = entry.unwrap();
+                let value = entry.value();
+                for i in 0..value.len() {
+                    let p = value.get(i);
+                    assert!(all_allocated.remove(&p));
+                    println!("{p:?}");
+                }
+            }
+        }
+        {
+            println!("Pending free (in system freed table)");
+            let mut system_tables = self.system_tables.lock();
+            let system_freed = system_tables
+                .open_system_table(self, SYSTEM_FREED_TABLE)
+                .unwrap();
+            for entry in system_freed
+                .range::<TransactionIdWithPagination>(..)
+                .unwrap()
+            {
+                let (_, entry) = entry.unwrap();
+                let value = entry.value();
+                for i in 0..value.len() {
+                    let p = value.get(i);
+                    assert!(all_allocated.remove(&p));
+                    println!("{p:?}");
+                }
+            }
+        }
+        {
+            let tables = self.tables.lock();
+            let pages = tables.freed_pages.lock();
+            if !pages.is_empty() {
+                println!("Pages in in-memory data freed_pages");
+                for p in pages.iter() {
+                    println!("{p:?}");
+                    assert!(all_allocated.remove(p));
+                }
+            }
+        }
+        {
+            let system_tables = self.system_tables.lock();
+            let pages = system_tables.freed_pages.lock();
+            if !pages.is_empty() {
+                println!("Pages in in-memory system freed_pages");
+                for p in pages.iter() {
+                    println!("{p:?}");
+                    assert!(all_allocated.remove(p));
+                }
+            }
+        }
+        if !all_allocated.is_empty() {
+            println!("Leaked pages");
+            for p in all_allocated {
+                println!("{p:?}");
+            }
+        }
+    }
+
+    /// Creates a snapshot of the current database state, which can be used to rollback the database.
+    /// This savepoint will exist until it is deleted with `[delete_savepoint()]`.
+    ///
+    /// Note that while a savepoint exists, pages that become unused after it was created are not freed.
+    /// Therefore, the lifetime of a savepoint should be minimized.
+    ///
+    /// Returns `[SavepointError::InvalidSavepoint`], if the transaction is "dirty" (any tables have been opened)
+    /// or if the transaction's durability is less than `[Durability::Immediate]`
+    pub fn persistent_savepoint(&self) -> Result<u64, SavepointError> {
+        if self.durability != InternalDurability::Immediate {
+            return Err(SavepointError::InvalidSavepoint);
+        }
+
+        let mut savepoint = self.ephemeral_savepoint()?;
+
+        let mut system_tables = self.system_tables.lock();
+
+        let mut next_table = system_tables.open_system_table(self, NEXT_SAVEPOINT_TABLE)?;
+        next_table.insert((), savepoint.get_id().next()?)?;
+        drop(next_table);
+
+        let mut savepoint_table = system_tables.open_system_table(self, SAVEPOINT_TABLE)?;
+        savepoint_table.insert(
+            savepoint.get_id(),
+            SerializedSavepoint::from_savepoint(&savepoint),
+        )?;
+
+        savepoint.set_persistent();
+
+        self.created_persistent_savepoints
+            .lock()
+            .insert(savepoint.get_id());
+
+        Ok(savepoint.get_id().0)
+    }
+
+    pub(crate) fn transaction_guard(&self) -> Arc<TransactionGuard> {
+        self.transaction_guard.clone()
+    }
+
+    pub(crate) fn next_persistent_savepoint_id(&self) -> Result<Option<SavepointId>> {
+        let mut system_tables = self.system_tables.lock();
+        let next_table = system_tables.open_system_table(self, NEXT_SAVEPOINT_TABLE)?;
+        let value = next_table.get(())?;
+        if let Some(next_id) = value {
+            Ok(Some(next_id.value()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a persistent savepoint given its id
+    pub fn get_persistent_savepoint(&self, id: u64) -> Result<Savepoint, SavepointError> {
+        let mut system_tables = self.system_tables.lock();
+        let table = system_tables.open_system_table(self, SAVEPOINT_TABLE)?;
+        let value = table.get(SavepointId(id))?;
+
+        match value {
+            Some(x) => Ok(x.value().to_savepoint(self.transaction_tracker.clone())?),
+            None => Err(SavepointError::InvalidSavepoint),
+        }
+    }
+
+    /// Delete the given persistent savepoint.
+    ///
+    /// Note that if the transaction is `abort()`'ed this deletion will be rolled back.
+    ///
+    /// Returns `true` if the savepoint existed
+    /// Returns `[SavepointError::InvalidSavepoint`] if the transaction's durability is less than `[Durability::Immediate]`
+    pub fn delete_persistent_savepoint(&self, id: u64) -> Result<bool, SavepointError> {
+        if self.durability != InternalDurability::Immediate {
+            return Err(SavepointError::InvalidSavepoint);
+        }
+        let mut system_tables = self.system_tables.lock();
+        let mut table = system_tables.open_system_table(self, SAVEPOINT_TABLE)?;
+        let savepoint = table.remove(SavepointId(id))?;
+        if let Some(serialized) = savepoint {
+            let savepoint = serialized
+                .value()
+                .to_savepoint(self.transaction_tracker.clone())?;
+            self.deleted_persistent_savepoints
+                .lock()
+                .push((savepoint.get_id(), savepoint.get_transaction_id()));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List all persistent savepoints
+    pub fn list_persistent_savepoints(&self) -> Result<impl Iterator<Item = u64>> {
+        let mut system_tables = self.system_tables.lock();
+        let table = system_tables.open_system_table(self, SAVEPOINT_TABLE)?;
+        let mut savepoints = vec![];
+        for savepoint in table.range::<SavepointId>(..)? {
+            savepoints.push(savepoint?.0.value().0);
+        }
+        Ok(savepoints.into_iter())
+    }
+
+    fn allocate_read_transaction(&self) -> Result<TransactionGuard> {
+        let id = self
+            .transaction_tracker
+            .register_read_transaction(&self.mem)?;
+
+        Ok(TransactionGuard::new_read(
+            id,
+            self.transaction_tracker.clone(),
+        ))
+    }
+
+    fn allocate_savepoint(&self) -> Result<(SavepointId, TransactionId)> {
+        let transaction_id = self.allocate_read_transaction()?.leak()?;
+        let id = self
+            .transaction_tracker
+            .allocate_savepoint(transaction_id)?;
+        Ok((id, transaction_id))
+    }
+
+    /// Creates a snapshot of the current database state, which can be used to rollback the database
+    ///
+    /// This savepoint will be freed as soon as the returned `[Savepoint]` is dropped.
+    ///
+    /// Returns `[SavepointError::InvalidSavepoint`], if the transaction is "dirty" (any tables have been opened)
+    pub fn ephemeral_savepoint(&self) -> Result<Savepoint, SavepointError> {
+        if self.dirty.load(Ordering::Acquire) {
+            return Err(SavepointError::InvalidSavepoint);
+        }
+
+        let (id, transaction_id) = self.allocate_savepoint()?;
+        #[cfg(feature = "logging")]
+        debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
+
+        let root = self.mem.get_data_root();
+        let savepoint = Savepoint::new_ephemeral(
+            &self.mem,
+            self.transaction_tracker.clone(),
+            id,
+            transaction_id,
+            root,
+        );
+
+        Ok(savepoint)
+    }
+
+    /// Restore the state of the database to the given [`Savepoint`]
+    ///
+    /// Calling this method invalidates all [`Savepoint`]s created after savepoint
+    pub fn restore_savepoint(&mut self, savepoint: &Savepoint) -> Result<(), SavepointError> {
+        // Ensure that user does not try to restore a Savepoint that is from a different Database
+        assert_eq!(
+            core::ptr::from_ref(self.transaction_tracker.as_ref()),
+            savepoint.db_address()
+        );
+
+        if !self
+            .transaction_tracker
+            .is_valid_savepoint(savepoint.get_id())?
+        {
+            return Err(SavepointError::InvalidSavepoint);
+        }
+        #[cfg(feature = "logging")]
+        debug!(
+            "Beginning savepoint restore (id={:?}) in transaction id={:?}",
+            savepoint.get_id(),
+            self.transaction_id
+        );
+        // Restoring a savepoint that reverted a file format or checksum type change could corrupt
+        // the database
+        assert_eq!(self.mem.get_version(), savepoint.get_version());
+        self.dirty.store(true, Ordering::Release);
+
+        // Restoring a savepoint needs to accomplish the following:
+        // 1) restore the table tree. This is trivial, since we have the old root
+        // 1a) we also filter the freed tree to remove any pages referenced by the old root
+        // 2) free all pages that were allocated since the savepoint and are unreachable
+        //    from the restored table tree root. Here we diff the reachable pages from the old
+        //    and new roots
+        // 3) update the system tree to remove invalid persistent savepoints.
+
+        // 1) Snapshot the pages this transaction allocated for USER-tree writes.
+        // Swapping the root below is what makes those unreachable, so they are
+        // exactly the set to free.
+        //
+        // This used to snapshot `drain_uncommitted()` -- every page allocated
+        // since the last commit -- on the assumption, stated in the old comment
+        // here, that they "were allocated for the rolled-back writes". That is
+        // false whenever a savepoint was created earlier in this same
+        // transaction: `persistent_savepoint` allocates SYSTEM-tree pages that
+        // stay live and referenced, because a restore rolls back the user tree
+        // and leaves system-tree changes in place.
+        //
+        // Freeing one of those discarded its pending write through
+        // `cancel_pending_write`, so the commit persisted a system tree
+        // pointing at bytes that were never written. The next open failed
+        // `verify_primary_checksums` on that page and rolled back to the
+        // previous commit -- losing a transaction that had committed durably.
+        // A crash after a successful commit must not lose it.
+        //
+        // The user tracker is the right source: it records only the pages this
+        // transaction allocated for user-tree content. Tracking is guaranteed
+        // on here, because it is disabled only when no savepoint exists (see
+        // `TableNamespace::mark_dirty`) and a restore requires one.
+        let orphaned_pages: Vec<PageNumber> = {
+            let tables = self.tables.lock();
+            let tracker = tables.allocated_pages.lock();
+            tracker.tracked_pages()
+        };
+
+        // 1a) restore the table tree (set_root also clears pending_table_updates)
+        {
+            self.tables.lock().set_root(savepoint.get_user_root())?;
+        }
+
+        // 1b) purge all transactions that happened after the savepoint from the data freed tree
+        let txn_id = savepoint.get_transaction_id().next()?.raw_id();
+        {
+            let lower = TransactionIdWithPagination {
+                transaction_id: txn_id,
+                pagination_id: 0,
+            };
+            let mut system_tables = self.system_tables.lock();
+            let mut data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
+            for entry in data_freed.extract_from_if(lower.., |_, _| true)? {
+                entry?;
+            }
+            // No need to process the system freed table, because it only rolls forward
+        }
+
+        // 2) queue all pages that became unreachable.
+        // First, clear freed_pages -- it may contain pages freed by the
+        // rolled-back B-tree operations (e.g., page splits during inserts).
+        // Those frees are invalid after restoring the old root because the
+        // old root still references the "freed" pages.
+        {
+            let tables = self.tables.lock();
+            let mut data_freed_pages = tables.freed_pages.lock();
+            data_freed_pages.clear();
+            let mut system_tables = self.system_tables.lock();
+            let data_allocated = system_tables.open_system_table(self, DATA_ALLOCATED_TABLE)?;
+            let lower = TransactionIdWithPagination {
+                transaction_id: txn_id,
+                pagination_id: 0,
+            };
+            for entry in data_allocated.range(lower..)? {
+                let (_, value) = entry?;
+                for i in 0..value.value().len() {
+                    data_freed_pages.push(value.value().get(i));
+                }
+            }
+        }
+
+        // 3) Invalidate all savepoints that are newer than the one being applied to prevent the user
+        // from later trying to restore a savepoint "on another timeline"
+        self.transaction_tracker
+            .invalidate_savepoints_after(savepoint.get_id())?;
+        for persistent_savepoint in self.list_persistent_savepoints()? {
+            if persistent_savepoint > savepoint.get_id().0 {
+                self.delete_persistent_savepoint(persistent_savepoint)?;
+            }
+        }
+
+        // 4) Free orphaned pages from the rolled-back writes.
+        // These were snapshotted in step 1 before any restore B-tree operations.
+        // They are unreachable from the restored tree root and must be returned
+        // to the buddy allocator to prevent a persistent storage leak.
+        if !orphaned_pages.is_empty() {
+            let tables = self.tables.lock();
+            let mut tracker = tables.allocated_pages.lock();
+            for page in orphaned_pages {
+                self.mem.free(page, &mut tracker)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set the desired durability level for writes made in this transaction
+    /// Defaults to [`Durability::Immediate`]
+    ///
+    /// If a persistent savepoint has been created or deleted, in this transaction, the durability may not
+    /// be reduced below [`Durability::Immediate`]
+    pub fn set_durability(&mut self, durability: Durability) -> Result<(), SetDurabilityError> {
+        let created = !self.created_persistent_savepoints.lock().is_empty();
+        let deleted = !self.deleted_persistent_savepoints.lock().is_empty();
+        if (created || deleted) && !matches!(durability, Durability::Immediate) {
+            return Err(SetDurabilityError::PersistentSavepointModified);
+        }
+
+        self.durability = match durability {
+            Durability::None => InternalDurability::None,
+            Durability::Immediate => InternalDurability::Immediate,
+        };
+
+        Ok(())
+    }
+
+    /// Enable or disable 2-phase commit (defaults to disabled)
+    ///
+    /// By default, data is written using the following 1-phase commit algorithm:
+    ///
+    /// 1. Update the inactive commit slot with the new database state
+    /// 2. Flip the god byte primary bit to activate the newly updated commit slot
+    /// 3. Call `fsync` to ensure all writes have been persisted to disk
+    ///
+    /// All data is written with checksums. When opening the database after a crash, the most
+    /// recent of the two commit slots with a valid checksum is used.
+    ///
+    /// Security considerations: The checksum used is xxhash, a fast, non-cryptographic hash
+    /// function with close to perfect collision resistance when used with non-malicious input. An
+    /// attacker with an extremely high degree of control over the database's workload, including
+    /// the ability to cause the database process to crash, can cause invalid data to be written
+    /// with a valid checksum, leaving the database in an invalid, attacker-controlled state.
+    ///
+    /// Alternatively, you can enable 2-phase commit, which writes data like this:
+    ///
+    /// 1. Update the inactive commit slot with the new database state
+    /// 2. Call `fsync` to ensure the database slate and commit slot update have been persisted
+    /// 3. Flip the god byte primary bit to activate the newly updated commit slot
+    /// 4. Call `fsync` to ensure the write to the god byte has been persisted
+    ///
+    /// This mitigates a theoretical attack where an attacker who
+    /// 1. can control the order in which pages are flushed to disk
+    /// 2. can introduce crashes during `fsync`,
+    /// 3. has knowledge of the database file contents, and
+    /// 4. can include arbitrary data in a write transaction
+    ///
+    /// could cause a transaction to partially commit (some but not all of the data is written).
+    /// This is described in the design doc in futher detail.
+    ///
+    /// Security considerations: Many hard disk drives and SSDs do not actually guarantee that data
+    /// has been persisted to disk after calling `fsync`. Even with 2-phase commit, an attacker with
+    /// a high degree of control over the database's workload, including the ability to cause the
+    /// database process to crash, can cause the database to crash with the god byte primary bit
+    /// pointing to an invalid commit slot, leaving the database in an invalid, potentially attacker-
+    /// controlled state.
+    pub fn set_two_phase_commit(&mut self, enabled: bool) {
+        self.two_phase_commit = enabled;
+    }
+
+    /// Enable or disable quick-repair (defaults to disabled)
+    ///
+    /// By default, when reopening the database after a crash, redb needs to do a full repair.
+    /// This involves walking the entire database to verify the checksums and reconstruct the
+    /// allocator state, so it can be very slow if the database is large.
+    ///
+    /// Alternatively, you can enable quick-repair. In this mode, redb saves the allocator state
+    /// as part of each commit (so it doesn't need to be reconstructed), and enables 2-phase commit
+    /// (which guarantees that the primary commit slot is valid without needing to look at the
+    /// checksums). This means commits are slower, but recovery after a crash is almost instant.
+    pub fn set_quick_repair(&mut self, enabled: bool) {
+        self.quick_repair = enabled;
+    }
+
+    /// Open the given table
+    ///
+    /// The table will be created if it does not exist
+    #[track_caller]
+    pub fn open_table<'txn, K: Key + 'static, V: Value + 'static>(
+        &'txn self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Table<'txn, K, V>, TableError> {
+        self.tables.lock().open_table(self, definition)
+    }
+
+    /// Open a TTL-enabled table.
+    ///
+    /// The table will be created if it does not exist. Values are stored with an
+    /// 8-byte expiry header; use `insert_with_ttl()` to set per-key lifetimes.
+    #[cfg(feature = "std")]
+    #[track_caller]
+    pub fn open_ttl_table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: crate::ttl_table::TtlTableDefinition<K, V>,
+    ) -> Result<crate::ttl_table::TtlTable<'_, K, V>, TableError> {
+        let inner = self.open_table(definition.inner_def())?;
+        Ok(crate::ttl_table::TtlTable::new(inner))
+    }
+
+    /// Open or create an IVF-PQ vector index for writing.
+    ///
+    /// The index tables will be created if they do not exist.
+    #[track_caller]
+    pub fn open_ivfpq_index(
+        &self,
+        definition: &crate::ivfpq::config::IvfPqIndexDefinition,
+    ) -> Result<crate::ivfpq::index::IvfPqIndex<'_, Self>, TableError> {
+        crate::ivfpq::index::IvfPqIndex::open(
+            self,
+            definition,
+            Arc::clone(&self.observer),
+            #[cfg(feature = "metrics")]
+            Arc::clone(&self.db_metrics),
+        )
+        .map_err(TableError::Storage)
+    }
+
+    /// Open the given table
+    ///
+    /// The table will be created if it does not exist
+    #[track_caller]
+    pub fn open_multimap_table<'txn, K: Key + 'static, V: Key + 'static>(
+        &'txn self,
+        definition: MultimapTableDefinition<K, V>,
+    ) -> Result<MultimapTable<'txn, K, V>, TableError> {
+        self.tables.lock().open_multimap_table(self, definition)
+    }
+
+    pub(crate) fn close_table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        name: &str,
+        table: &BtreeMut<K, V>,
+        length: u64,
+    ) {
+        self.tables.lock().close_table(name, table, length);
+    }
+
+    /// Rename the given table
+    pub fn rename_table(
+        &self,
+        definition: impl TableHandle,
+        new_name: impl TableHandle,
+    ) -> Result<(), TableError> {
+        let name = definition.name().to_string();
+        // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
+        drop(definition);
+        self.tables
+            .lock()
+            .rename_table(self, &name, new_name.name())
+    }
+
+    /// Rename the given multimap table
+    pub fn rename_multimap_table(
+        &self,
+        definition: impl MultimapTableHandle,
+        new_name: impl MultimapTableHandle,
+    ) -> Result<(), TableError> {
+        let name = definition.name().to_string();
+        // Drop the definition so that callers can pass in a `MultimapTable` to rename, without getting a TableAlreadyOpen error
+        drop(definition);
+        self.tables
+            .lock()
+            .rename_multimap_table(self, &name, new_name.name())
+    }
+
+    /// Delete the given table
+    ///
+    /// Returns a bool indicating whether the table existed
+    pub fn delete_table(&self, definition: impl TableHandle) -> Result<bool, TableError> {
+        let name = definition.name().to_string();
+        // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
+        drop(definition);
+        self.tables.lock().delete_table(self, &name)
+    }
+
+    /// Delete the given table
+    ///
+    /// Returns a bool indicating whether the table existed
+    pub fn delete_multimap_table(
+        &self,
+        definition: impl MultimapTableHandle,
+    ) -> Result<bool, TableError> {
+        let name = definition.name().to_string();
+        // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
+        drop(definition);
+        self.tables.lock().delete_multimap_table(self, &name)
+    }
+
+    /// List all the tables
+    pub fn list_tables(&self) -> Result<impl Iterator<Item = UntypedTableHandle> + '_> {
+        self.tables
+            .lock()
+            .table_tree
+            .list_tables(TableType::Normal)
+            .map(|x| x.into_iter().map(UntypedTableHandle::new))
+    }
+
+    /// List all the multimap tables
+    pub fn list_multimap_tables(
+        &self,
+    ) -> Result<impl Iterator<Item = UntypedMultimapTableHandle> + '_> {
+        self.tables
+            .lock()
+            .table_tree
+            .list_tables(TableType::Multimap)
+            .map(|x| x.into_iter().map(UntypedMultimapTableHandle::new))
+    }
+
+    // -----------------------------------------------------------------------
+    // Blob store operations
+    // -----------------------------------------------------------------------
+
+    /// Store a blob with temporal, causal, tag, and namespace metadata.
+    ///
+    /// The blob data is written to the append-only blob region, and indexed in
+    /// the `BLOB_TABLE`, `BLOB_TEMPORAL_INDEX`, and optionally
+    /// `BLOB_CAUSAL_EDGES`, `BLOB_TAG_INDEX`, `BLOB_NAMESPACE` system tables.
+    ///
+    /// Returns the assigned `BlobId`.
+    pub fn store_blob(
+        &self,
+        data: &[u8],
+        content_type: ContentType,
+        label: &str,
+        opts: StoreOptions,
+    ) -> Result<BlobId> {
+        if self.blob_writer_active.load(Ordering::Acquire) {
+            return Err(StorageError::BlobWriterActive);
+        }
+
+        // 1. Assign sequence number from the B-tree counter
+        let sequence = self.next_blob_sequence()?;
+
+        // 2. Compute content prefix hash and full checksum
+        let prefix_len = data.len().min(4096);
+        let content_prefix_hash = xxh3_hash64(&data[..prefix_len]);
+        let blob_id = BlobId::new(sequence, content_prefix_hash);
+        let checksum = xxh3_hash128(data);
+
+        // 3. Dedup check: compute SHA-256 and look for existing identical blob
+        let dedup_eligible =
+            self.blob_dedup_config.enabled && data.len() >= self.blob_dedup_config.min_size;
+        let sha_key = if dedup_eligible {
+            let hash: [u8; 32] = Sha256::digest(data).into();
+            Some(Sha256Key(hash))
+        } else {
+            None
+        };
+
+        let dedup_hit = if let Some(ref sha_key) = sha_key {
+            let mut system_tables = self.system_tables.lock();
+            let dedup_table = system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+            dedup_table.get(sha_key)?.map(|g| g.value())
+        } else {
+            None
+        };
+
+        let mut dedup_saved = 0u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let blob_ref = if let Some(existing) = dedup_hit
+            && existing.checksum == checksum
+            && existing.length == data.len() as u64
+        {
+            // Reuse existing chunks via source_sequence stored in `offset`.
+            dedup_saved = existing.length;
+            BlobRef {
+                offset: existing.offset, // source_sequence for chunk reads
+                length: existing.length,
+                checksum,
+                ref_count: 1,
+                content_type: content_type.as_byte(),
+                compression: 0,
+            }
+        } else {
+            // 4. Write blob data as chunks into the BLOB_CHUNKS B-tree
+            self.write_blob_chunks(sequence, data)?;
+
+            BlobRef {
+                offset: u64::MAX, // sentinel = own chunks (non-deduped)
+                length: data.len() as u64,
+                checksum,
+                ref_count: 1,
+                content_type: content_type.as_byte(),
+                compression: 0,
+            }
+        };
+
+        // 5. Advance HLC
+        let hlc_raw = self.advance_blob_hlc()?;
+        let hlc = HybridLogicalClock::from_raw(hlc_raw);
+
+        // as_nanos() returns u128, but u64 nanoseconds covers ~584 years from epoch.
+        // Truncation is intentional and safe for any realistic timestamp.
+        #[allow(clippy::cast_possible_truncation)]
+        let wall_clock_ns = {
+            #[cfg(feature = "std")]
+            {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                0u64
+            }
+        };
+
+        // 6. Build BlobMeta
+        let causal_parent = opts.causal_link.as_ref().map(|l| l.parent);
+        let meta = BlobMeta::new(blob_ref, wall_clock_ns, hlc.to_raw(), causal_parent, label);
+
+        // 7. Index in system tables
+        {
+            let mut system_tables = self.system_tables.lock();
+
+            let mut blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+            blob_table.insert(&blob_id, &meta)?;
+            drop(blob_table);
+
+            let temporal_key = TemporalKey::new(wall_clock_ns, hlc, blob_id);
+            let mut temporal_table = system_tables.open_system_table(self, BLOB_TEMPORAL_INDEX)?;
+            temporal_table.insert(&temporal_key, &())?;
+            drop(temporal_table);
+
+            if let Some(link) = &opts.causal_link {
+                let edge = CausalEdge::new(blob_id, link.relation, &link.context);
+                let edge_key = CausalEdgeKey::new(link.parent, blob_id);
+                let mut causal_table = system_tables.open_system_table(self, BLOB_CAUSAL_EDGES)?;
+                causal_table.insert(&edge_key, &edge)?;
+                drop(causal_table);
+            }
+
+            Self::index_tags_and_namespace(
+                &mut system_tables,
+                self,
+                blob_id,
+                &opts.tags,
+                opts.namespace.as_deref(),
+            )?;
+
+            // 7b. Update dedup index
+            if let Some(sha_key) = sha_key {
+                if let Some(existing) = dedup_hit {
+                    let mut dedup_table =
+                        system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+                    let updated = DedupVal {
+                        ref_count: existing.ref_count + 1,
+                        ..existing
+                    };
+                    dedup_table.insert(&sha_key, &updated)?;
+                    drop(dedup_table);
+                } else {
+                    // New dedup entry: store source sequence in offset field
+                    let mut dedup_table =
+                        system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+                    let entry = DedupVal {
+                        offset: sequence, // source_sequence for chunk reads
+                        length: blob_ref.length,
+                        checksum: blob_ref.checksum,
+                        ref_count: 1,
+                    };
+                    dedup_table.insert(&sha_key, &entry)?;
+                    drop(dedup_table);
+                }
+
+                let mut dedup_map = system_tables.open_system_table(self, BLOB_DEDUP_MAP)?;
+                dedup_map.insert(&blob_id, &sha_key)?;
+                drop(dedup_map);
+            }
+        }
+
+        self.dirty.store(true, Ordering::Release);
+
+        // 8. Observer / metrics
+        if dedup_saved > 0 {
+            self.observer.on_blob_dedup(blob_id.sequence, dedup_saved);
+            #[cfg(feature = "metrics")]
+            self.db_metrics
+                .blob_dedup_hits
+                .fetch_add(1, portable_atomic::Ordering::Relaxed);
+        } else {
+            self.observer
+                .on_blob_write(blob_id.sequence, blob_ref.length);
+            #[cfg(feature = "metrics")]
+            self.db_metrics
+                .blob_writes
+                .fetch_add(1, portable_atomic::Ordering::Relaxed);
+        }
+
+        Ok(blob_id)
+    }
+
+    /// Create a streaming blob writer that writes data in arbitrary-sized
+    /// chunks with constant memory overhead.
+    ///
+    /// Only one `BlobWriter` may be active at a time. Calling `blob_writer()`
+    /// or `store_blob()` while a writer is active returns
+    /// [`StorageError::BlobWriterActive`].
+    pub fn blob_writer(
+        &self,
+        content_type: ContentType,
+        label: &str,
+        opts: StoreOptions,
+    ) -> Result<BlobWriter<'_>> {
+        if self
+            .blob_writer_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(StorageError::BlobWriterActive);
+        }
+
+        let sequence = self.next_blob_sequence()?;
+
+        Ok(BlobWriter::new(
+            self,
+            sequence,
+            content_type,
+            label,
+            opts,
+            self.blob_dedup_config.enabled,
+        ))
+    }
+
+    /// Write a single chunk of blob data to the `BLOB_CHUNKS` table.
+    /// Called by `BlobWriter` when a chunk buffer is full or at finalization.
+    pub(crate) fn blob_write_chunk(&self, sequence: u64, chunk_index: u32, data: &[u8]) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let mut chunks_table = system_tables.open_system_table(self, BLOB_CHUNKS)?;
+        let key = BlobChunkKey::new(sequence, chunk_index);
+        chunks_table.insert(&key, data)?;
+        Ok(())
+    }
+
+    /// Called by `BlobWriter::finish()` to index the completed blob
+    /// in system tables.
+    pub(crate) fn finalize_blob_writer(
+        &self,
+        blob_id: BlobId,
+        mut meta: BlobMeta,
+        _bytes_written: u64,
+        opts: StoreOptions,
+        sha_key: Option<Sha256Key>,
+    ) -> Result {
+        // Advance HLC
+        let hlc_raw = self.advance_blob_hlc()?;
+        meta.hlc = hlc_raw;
+
+        // Index in system tables
+        {
+            let mut system_tables = self.system_tables.lock();
+
+            let mut blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+            blob_table.insert(&blob_id, &meta)?;
+            drop(blob_table);
+
+            let temporal_key = TemporalKey::new(
+                meta.wall_clock_ns,
+                HybridLogicalClock::from_raw(hlc_raw),
+                blob_id,
+            );
+            let mut temporal_table = system_tables.open_system_table(self, BLOB_TEMPORAL_INDEX)?;
+            temporal_table.insert(&temporal_key, &())?;
+            drop(temporal_table);
+
+            if let Some(link) = &opts.causal_link {
+                let edge = CausalEdge::new(blob_id, link.relation, &link.context);
+                let edge_key = CausalEdgeKey::new(link.parent, blob_id);
+                let mut causal_table = system_tables.open_system_table(self, BLOB_CAUSAL_EDGES)?;
+                causal_table.insert(&edge_key, &edge)?;
+                drop(causal_table);
+            }
+
+            Self::index_tags_and_namespace(
+                &mut system_tables,
+                self,
+                blob_id,
+                &opts.tags,
+                opts.namespace.as_deref(),
+            )?;
+
+            // Update dedup index for streaming writes
+            if let Some(sha_key) = sha_key {
+                let existing = {
+                    let dedup_table = system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+                    dedup_table.get(&sha_key)?.map(|g| g.value())
+                };
+
+                if let Some(existing) = existing {
+                    let mut dedup_table =
+                        system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+                    let updated = DedupVal {
+                        ref_count: existing.ref_count + 1,
+                        ..existing
+                    };
+                    dedup_table.insert(&sha_key, &updated)?;
+                    drop(dedup_table);
+                } else {
+                    let mut dedup_table =
+                        system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+                    let entry = DedupVal {
+                        offset: blob_id.sequence, // source_sequence for chunk reads
+                        length: meta.blob_ref.length,
+                        checksum: meta.blob_ref.checksum,
+                        ref_count: 1,
+                    };
+                    dedup_table.insert(&sha_key, &entry)?;
+                    drop(dedup_table);
+                }
+
+                let mut dedup_map = system_tables.open_system_table(self, BLOB_DEDUP_MAP)?;
+                dedup_map.insert(&blob_id, &sha_key)?;
+                drop(dedup_map);
+            }
+        }
+
+        self.dirty.store(true, Ordering::Release);
+
+        Ok(())
+    }
+
+    /// Access the blob-writer-active flag. Used by `BlobWriter::drop`.
+    pub(crate) fn blob_writer_active(&self) -> &AtomicBool {
+        &self.blob_writer_active
+    }
+
+    /// Allocate the next blob sequence number and persist it in `BLOB_COUNTERS`.
+    fn next_blob_sequence(&self) -> Result<u64> {
+        let mut system_tables = self.system_tables.lock();
+        let mut counters = system_tables.open_system_table(self, BLOB_COUNTERS)?;
+        let current = counters
+            .get(&BLOB_COUNTER_NEXT_SEQ)?
+            .map_or(0, |g| g.value());
+        counters.insert(&BLOB_COUNTER_NEXT_SEQ, &(current + 1))?;
+        Ok(current)
+    }
+
+    /// Advance the blob HLC counter and persist it in `BLOB_COUNTERS`.
+    /// Returns the new HLC raw value.
+    fn advance_blob_hlc(&self) -> Result<u64> {
+        let mut system_tables = self.system_tables.lock();
+        let mut counters = system_tables.open_system_table(self, BLOB_COUNTERS)?;
+        let current = counters.get(&BLOB_COUNTER_HLC)?.map_or(0, |g| g.value());
+        let hlc = HybridLogicalClock::from_raw(current).advance();
+        let raw = hlc.to_raw();
+        counters.insert(&BLOB_COUNTER_HLC, &raw)?;
+        Ok(raw)
+    }
+
+    /// Write blob data as `BLOB_CHUNK_SIZE`-byte chunks into the `BLOB_CHUNKS` table.
+    fn write_blob_chunks(&self, sequence: u64, data: &[u8]) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let mut chunks_table = system_tables.open_system_table(self, BLOB_CHUNKS)?;
+        let mut chunk_index = 0u32;
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + BLOB_CHUNK_SIZE).min(data.len());
+            let chunk_key = BlobChunkKey::new(sequence, chunk_index);
+            chunks_table.insert(&chunk_key, &data[offset..end])?;
+            offset = end;
+            chunk_index += 1;
+        }
+        // For zero-length blobs, no chunks are written (length=0 in BlobRef).
+        Ok(())
+    }
+
+    /// Read all chunks for a blob sequence from `BLOB_CHUNKS` and concatenate.
+    fn read_blob_chunks_from_system_table(
+        &self,
+        source_sequence: u64,
+        expected_length: u64,
+    ) -> Result<Vec<u8>> {
+        let mut system_tables = self.system_tables.lock();
+        let chunks_table = system_tables.open_system_table(self, BLOB_CHUNKS)?;
+
+        let start_key = BlobChunkKey::new(source_sequence, 0);
+        let end_key = BlobChunkKey::new(source_sequence, u32::MAX);
+        let range = chunks_table.range(start_key..=end_key)?;
+
+        let mut buf = Vec::with_capacity(blob_prealloc(expected_length));
+        for entry in range {
+            let (_, value_guard) = entry?;
+            buf.extend_from_slice(value_guard.value());
+        }
+        if buf.len() as u64 != expected_length {
+            return Err(StorageError::Corrupted(alloc::format!(
+                "blob seq {}: expected {} bytes, assembled {}",
+                source_sequence,
+                expected_length,
+                buf.len()
+            )));
+        }
+        Ok(buf)
+    }
+
+    /// Delete all chunks for a blob sequence from `BLOB_CHUNKS`.
+    fn delete_blob_chunks(&self, sequence: u64) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let chunks_table = system_tables.open_system_table(self, BLOB_CHUNKS)?;
+        let start_key = BlobChunkKey::new(sequence, 0);
+        let end_key = BlobChunkKey::new(sequence, u32::MAX);
+        let range = chunks_table.range(start_key..=end_key)?;
+        let keys: Vec<BlobChunkKey> = range
+            .map(|entry| entry.map(|(k, _)| k.value()))
+            .collect::<Result<Vec<_>>>()?;
+        drop(chunks_table);
+
+        if !keys.is_empty() {
+            let mut chunks_table_mut = system_tables.open_system_table(self, BLOB_CHUNKS)?;
+            for key in keys {
+                chunks_table_mut.remove(&key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the source sequence for reading a blob's chunks.
+    /// Non-deduped blobs (`offset == u64::MAX`) use their own sequence.
+    /// Deduped blobs store the source sequence in `BlobRef.offset`.
+    /// Resolve which sequence number holds the actual chunk data.
+    /// `blob_ref.offset == u64::MAX` means own chunks (non-deduped).
+    /// Otherwise, `blob_ref.offset` is the source sequence for dedup reads.
+    fn resolve_chunk_source(blob_id: &BlobId, blob_ref: &BlobRef) -> u64 {
+        if blob_ref.offset == u64::MAX {
+            blob_id.sequence
+        } else {
+            blob_ref.offset
+        }
+    }
+
+    /// Read a byte range from blob chunks without assembling the entire blob.
+    #[allow(clippy::cast_possible_truncation)]
+    fn read_blob_chunk_range(
+        &self,
+        source_sequence: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let chunk_size = BLOB_CHUNK_SIZE as u64;
+        let start_chunk = (offset / chunk_size) as u32;
+        let end_chunk = ((offset + length).saturating_sub(1) / chunk_size) as u32;
+
+        let mut system_tables = self.system_tables.lock();
+        let chunks_table = system_tables.open_system_table(self, BLOB_CHUNKS)?;
+
+        let start_key = BlobChunkKey::new(source_sequence, start_chunk);
+        let end_key = BlobChunkKey::new(source_sequence, end_chunk);
+        let range = chunks_table.range(start_key..=end_key)?;
+
+        let mut buf = Vec::with_capacity(blob_prealloc(length));
+        let mut global_pos = u64::from(start_chunk) * chunk_size;
+        for entry in range {
+            let (_, value_guard) = entry?;
+            let chunk_data: &[u8] = value_guard.value();
+            let chunk_end = global_pos + chunk_data.len() as u64;
+
+            let read_start = offset.max(global_pos);
+            let read_end = (offset + length).min(chunk_end);
+            if read_start < read_end {
+                let local_start = (read_start - global_pos) as usize;
+                let local_end = (read_end - global_pos) as usize;
+                buf.extend_from_slice(&chunk_data[local_start..local_end]);
+            }
+            global_pos = chunk_end;
+        }
+        Ok(buf)
+    }
+
+    pub(crate) fn read_blob_chunks_into(
+        &self,
+        source_sequence: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let table = system_tables.open_system_table(self, BLOB_CHUNKS)?;
+        crate::blob_store::reader::copy_chunks(offset, output, |index, local, part| {
+            let key = BlobChunkKey::new(source_sequence, index);
+            let guard = table.get(&key)?.ok_or_else(|| {
+                StorageError::Corrupted(alloc::format!("blob chunk {index} missing"))
+            })?;
+            crate::blob_store::reader::copy_chunk(guard.value(), local, part)
+        })
+    }
+
+    /// Index tags and namespace for a blob. Called from both `store_blob` and
+    /// `finalize_blob_writer`.
+    fn index_tags_and_namespace(
+        system_tables: &mut SystemNamespace<'_>,
+        txn: &WriteTransaction,
+        blob_id: BlobId,
+        tags: &[String],
+        namespace: Option<&str>,
+    ) -> Result {
+        let tag_count = tags.len().min(MAX_TAGS_PER_BLOB);
+        if tag_count > 0 {
+            let mut tag_table = system_tables.open_system_table(txn, BLOB_TAG_INDEX)?;
+            for tag in &tags[..tag_count] {
+                let tag_key = TagKey::new(tag, blob_id);
+                tag_table.insert(&tag_key, &())?;
+            }
+            drop(tag_table);
+        }
+
+        if let Some(ns) = namespace {
+            let ns_val = NamespaceVal::new(ns);
+            let mut ns_table = system_tables.open_system_table(txn, BLOB_NAMESPACE)?;
+            ns_table.insert(&blob_id, &ns_val)?;
+            drop(ns_table);
+
+            let ns_key = NamespaceKey::new(ns, blob_id);
+            let mut ns_idx = system_tables.open_system_table(txn, BLOB_NAMESPACE_INDEX)?;
+            ns_idx.insert(&ns_key, &())?;
+            drop(ns_idx);
+        }
+
+        Ok(())
+    }
+
+    /// Get tags for a blob within a write transaction.
+    pub fn blob_tags(&self, blob_id: &BlobId) -> Result<Vec<String>> {
+        let mut system_tables = self.system_tables.lock();
+        let tag_table = system_tables.open_system_table(self, BLOB_TAG_INDEX)?;
+
+        let mut tags = Vec::new();
+        // Scan all tag keys -- we need to find entries where blob_id matches.
+        // Since TagKey is ordered (tag, blob_id), we scan the full table.
+        // This is acceptable for the write-path read (low frequency).
+        let range = tag_table.range::<TagKey>(..)?;
+        for entry in range {
+            let (key_guard, _) = entry?;
+            let key = key_guard.value();
+            if key.blob_id == *blob_id {
+                tags.push(key.tag_str().to_string());
+            }
+        }
+        Ok(tags)
+    }
+
+    /// Get namespace for a blob within a write transaction.
+    pub fn blob_namespace(&self, blob_id: &BlobId) -> Result<Option<String>> {
+        let mut system_tables = self.system_tables.lock();
+        let ns_table = system_tables.open_system_table(self, BLOB_NAMESPACE)?;
+        match ns_table.get(blob_id)? {
+            Some(g) => Ok(Some(g.value().namespace_str().to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Retrieve a blob's data and metadata by its `BlobId`.
+    ///
+    /// The returned data is verified against the stored xxh3-128 checksum.
+    pub fn get_blob(&self, blob_id: &BlobId) -> Result<Option<(Vec<u8>, BlobMeta)>> {
+        let meta = {
+            let mut system_tables = self.system_tables.lock();
+            let blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+            match blob_table.get(blob_id)? {
+                Some(g) => g.value(),
+                None => return Ok(None),
+            }
+        };
+
+        if meta.blob_ref.length == 0 {
+            return Ok(Some((Vec::new(), meta)));
+        }
+
+        let source_seq = Self::resolve_chunk_source(blob_id, &meta.blob_ref);
+        let data = self.read_blob_chunks_from_system_table(source_seq, meta.blob_ref.length)?;
+
+        let actual = xxh3_hash128(&data);
+        if actual != meta.blob_ref.checksum {
+            return Err(StorageError::BlobChecksumMismatch {
+                sequence: blob_id.sequence,
+                expected: meta.blob_ref.checksum,
+                actual,
+            });
+        }
+
+        Ok(Some((data, meta)))
+    }
+
+    /// Retrieve only a blob's metadata (no data read).
+    pub fn get_blob_meta(&self, blob_id: &BlobId) -> Result<Option<BlobMeta>> {
+        let mut system_tables = self.system_tables.lock();
+        let blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+
+        let guard = blob_table.get(blob_id)?;
+        Ok(guard.map(|g| g.value()))
+    }
+
+    /// Read a byte range from a blob without checksum verification.
+    ///
+    /// Returns `None` if the blob does not exist. Returns
+    /// [`StorageError::BlobRangeOutOfBounds`] if `offset + length` exceeds the
+    /// blob's total size.
+    pub fn read_blob_range(
+        &self,
+        blob_id: &BlobId,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let meta = {
+            let mut system_tables = self.system_tables.lock();
+            let blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+            match blob_table.get(blob_id)? {
+                Some(g) => g.value(),
+                None => return Ok(None),
+            }
+        };
+
+        if length == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let end = offset.saturating_add(length);
+        if end > meta.blob_ref.length {
+            return Err(StorageError::BlobRangeOutOfBounds {
+                blob_length: meta.blob_ref.length,
+                requested_offset: offset,
+                requested_length: length,
+            });
+        }
+
+        let source_seq = Self::resolve_chunk_source(blob_id, &meta.blob_ref);
+        let data = self.read_blob_chunk_range(source_seq, offset, length)?;
+
+        Ok(Some(data))
+    }
+
+    /// Open a lazy reader without reading the body. No whole-blob checksum is
+    /// verified. Mutating/deleting this blob in the same write transaction while
+    /// reading is unsupported; use a read transaction for snapshot isolation.
+    pub fn blob_reader(&self, blob_id: &BlobId) -> Result<Option<BlobReader<'_>>> {
+        let Some(meta) = self.get_blob_meta(blob_id)? else {
+            return Ok(None);
+        };
+        let source_seq = Self::resolve_chunk_source(blob_id, &meta.blob_ref);
+        Ok(Some(BlobReader::from_write(
+            self,
+            source_seq,
+            meta.blob_ref.length,
+        )))
+    }
+
+    /// Delete a blob and remove it from all indexes.
+    pub fn delete_blob(&self, blob_id: &BlobId) -> Result<bool> {
+        let mut system_tables = self.system_tables.lock();
+
+        // Read metadata to find temporal key and causal parent
+        let meta = {
+            let blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+            match blob_table.get(blob_id)? {
+                Some(g) => g.value(),
+                None => return Ok(false),
+            }
+        };
+
+        // Remove from temporal index
+        let temporal_key = TemporalKey::new(
+            meta.wall_clock_ns,
+            HybridLogicalClock::from_raw(meta.hlc),
+            *blob_id,
+        );
+
+        let mut temporal_table = system_tables.open_system_table(self, BLOB_TEMPORAL_INDEX)?;
+        temporal_table.remove(&temporal_key)?;
+        drop(temporal_table);
+
+        // Remove incoming causal edge (parent -> this blob).
+        if let Some(parent) = meta.causal_parent {
+            let mut edges_table = system_tables.open_system_table(self, BLOB_CAUSAL_EDGES)?;
+            edges_table.remove(&CausalEdgeKey::new(parent, *blob_id))?;
+            drop(edges_table);
+
+            // Also remove from legacy table only if it points to this blob
+            let mut legacy_table = system_tables.open_system_table(self, BLOB_CAUSAL_CHILDREN)?;
+            let should_remove_legacy = legacy_table
+                .get(&parent)?
+                .is_some_and(|g| g.value() == *blob_id);
+            if should_remove_legacy {
+                legacy_table.remove(&parent)?;
+            }
+            drop(legacy_table);
+        }
+
+        // Remove outgoing causal edges (this blob -> children). Without this,
+        // deleting a parent blob leaves dangling edge entries that waste space
+        // and could confuse causal graph traversals.
+        {
+            let edges_table = system_tables.open_system_table(self, BLOB_CAUSAL_EDGES)?;
+            let start = CausalEdgeKey::new(*blob_id, BlobId::MIN);
+            let end = CausalEdgeKey::new(*blob_id, BlobId::MAX);
+            let mut outgoing = Vec::new();
+            if let Ok(range) = edges_table.range(start..=end) {
+                for entry in range {
+                    let (key_guard, _) = entry?;
+                    outgoing.push(key_guard.value());
+                }
+            }
+            drop(edges_table);
+
+            if !outgoing.is_empty() {
+                let mut edges_table = system_tables.open_system_table(self, BLOB_CAUSAL_EDGES)?;
+                for key in &outgoing {
+                    edges_table.remove(key)?;
+                }
+                drop(edges_table);
+            }
+        }
+
+        // Remove tag index entries -- scan for all TagKeys that reference this blob
+        {
+            let mut tag_table = system_tables.open_system_table(self, BLOB_TAG_INDEX)?;
+            let mut to_remove = Vec::new();
+            let range = tag_table.range::<TagKey>(..)?;
+            for entry in range {
+                let (key_guard, _) = entry?;
+                let key = key_guard.value();
+                if key.blob_id == *blob_id {
+                    to_remove.push(key);
+                }
+            }
+            for key in &to_remove {
+                tag_table.remove(key)?;
+            }
+            drop(tag_table);
+        }
+
+        // Remove namespace entries
+        {
+            let ns_key = {
+                let ns_table = system_tables.open_system_table(self, BLOB_NAMESPACE)?;
+                match ns_table.get(blob_id)? {
+                    Some(ns_guard) => {
+                        let ns_str = ns_guard.value().namespace_str().to_string();
+                        Some(NamespaceKey::new(&ns_str, *blob_id))
+                    }
+                    None => None,
+                }
+            };
+
+            if let Some(ns_key) = ns_key {
+                let mut ns_table = system_tables.open_system_table(self, BLOB_NAMESPACE)?;
+                ns_table.remove(blob_id)?;
+                drop(ns_table);
+
+                let mut ns_idx = system_tables.open_system_table(self, BLOB_NAMESPACE_INDEX)?;
+                ns_idx.remove(&ns_key)?;
+                drop(ns_idx);
+            }
+        }
+
+        // Remove dedup entries (if this blob was dedup-indexed)
+        let sha_key = {
+            let dedup_map = system_tables.open_system_table(self, BLOB_DEDUP_MAP)?;
+            let result = dedup_map.get(blob_id)?.map(|g| g.value());
+            drop(dedup_map);
+            result
+        };
+
+        let mut delete_source_chunks = false;
+        let source_seq = Self::resolve_chunk_source(blob_id, &meta.blob_ref);
+
+        if let Some(sha_key) = sha_key {
+            let dedup_val = {
+                let dedup_idx = system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+                let result = dedup_idx.get(&sha_key)?.map(|g| g.value());
+                drop(dedup_idx);
+                result
+            };
+
+            if let Some(val) = dedup_val {
+                let mut dedup_idx = system_tables.open_system_table(self, BLOB_DEDUP_INDEX)?;
+                if val.ref_count > 1 {
+                    let updated = DedupVal {
+                        offset: val.offset,
+                        length: val.length,
+                        checksum: val.checksum,
+                        ref_count: val.ref_count - 1,
+                    };
+                    dedup_idx.insert(&sha_key, &updated)?;
+                } else {
+                    dedup_idx.remove(&sha_key)?;
+                    // Last reference to shared chunks -- delete them
+                    delete_source_chunks = true;
+                }
+                drop(dedup_idx);
+            }
+
+            let mut dedup_map = system_tables.open_system_table(self, BLOB_DEDUP_MAP)?;
+            dedup_map.remove(blob_id)?;
+            drop(dedup_map);
+        } else {
+            // Non-deduped blob -- always delete its chunks
+            delete_source_chunks = true;
+        }
+
+        // Remove from primary table
+        let mut blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+        blob_table.remove(blob_id)?;
+        drop(blob_table);
+        drop(system_tables);
+
+        // Delete chunks outside the system_tables lock (delete_blob_chunks
+        // acquires it internally)
+        if delete_source_chunks && meta.blob_ref.length > 0 {
+            self.delete_blob_chunks(source_seq)?;
+        }
+
+        self.dirty.store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    /// Returns statistics about blob store usage.
+    ///
+    /// With chunked B-tree storage, there is no separate blob region and no
+    /// fragmentation -- dead chunks are freed by normal B-tree GC. The
+    /// `region_bytes` field equals `live_bytes` and `dead_bytes` is always 0.
+    pub fn blob_stats(&self) -> Result<BlobStats> {
+        let mut system_tables = self.system_tables.lock();
+        let blob_table = system_tables.open_system_table(self, BLOB_TABLE)?;
+
+        let mut blob_count: u64 = 0;
+        let mut live_bytes: u64 = 0;
+
+        let range = blob_table.range::<BlobId>(..)?;
+        for entry in range {
+            let (_, value_guard) = entry?;
+            let meta = value_guard.value();
+            blob_count += 1;
+            // Only count physical storage: blobs with offset == u64::MAX own their
+            // chunks. Dedup references (offset == source_sequence) share chunks with
+            // the original blob and don't occupy additional space.
+            if meta.blob_ref.offset == u64::MAX {
+                live_bytes += meta.blob_ref.length;
+            }
+        }
+        drop(blob_table);
+
+        Ok(BlobStats {
+            blob_count,
+            live_bytes,
+            region_bytes: live_bytes, // No separate region -- data is in B-tree
+            dead_bytes: 0,
+            fragmentation_ratio: 0.0,
+        })
+    }
+
+    /// Blob compaction pass. With chunked B-tree storage, blob data is managed
+    /// by the normal B-tree page allocator -- there is no separate region to
+    /// compact. This method is retained for API compatibility and returns (0, 0).
+    #[allow(clippy::unused_self)]
+    pub(crate) fn compact_blobs_pass(&self, _write_from_zero: bool) -> Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+
+    /// Commit the transaction
+    ///
+    /// All writes performed in this transaction will be visible to future transactions, and are
+    /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
+    pub fn commit(mut self) -> Result<(), CommitError> {
+        // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
+        self.completed = true;
+        self.commit_inner()
+    }
+
+    fn commit_inner(&mut self) -> Result<(), CommitError> {
+        #[cfg(feature = "std")]
+        let commit_start = std::time::Instant::now();
+
+        // Quick-repair requires 2-phase commit
+        if self.quick_repair {
+            self.two_phase_commit = true;
+        }
+
+        // Early freed page processing: reclaim pages from previous transactions BEFORE
+        // this transaction's B-tree mutations, so the buddy allocator can reuse them.
+        // Without this, freed pages from transaction N are only returned to the allocator
+        // during transaction N+1's commit -- after N+1 has already allocated fresh pages.
+        //
+        // Only done for durable commits. Non-durable commits have complex savepoint
+        // interactions that require freed page processing to stay in the commit path.
+        //
+        if matches!(self.durability, InternalDurability::Immediate) {
+            let free_until_transaction = self
+                .transaction_tracker
+                .oldest_live_read_transaction()?
+                .map(|x| x.next())
+                .transpose()?
+                .unwrap_or(self.transaction_id);
+            if let Err(err) = self.process_freed_pages(free_until_transaction) {
+                self.tables.lock().table_tree.clear_root_updates_and_close();
+                return Err(err.into());
+            }
+        }
+
+        let (user_root, allocated_pages, data_freed) =
+            self.tables.lock().table_tree.flush_and_close()?;
+
+        let dirty_page_count = allocated_pages.len() as u64;
+        self.store_data_freed_pages(data_freed)?;
+        self.store_allocated_pages(allocated_pages.into_iter().collect())?;
+        self.flush_cdc_log()?;
+
+        #[cfg(feature = "logging")]
+        debug!(
+            "Committing transaction id={:?} with durability={:?} two_phase={} quick_repair={}",
+            self.transaction_id, self.durability, self.two_phase_commit, self.quick_repair
+        );
+        match self.durability {
+            InternalDurability::None => self.non_durable_commit(user_root)?,
+            InternalDurability::Immediate => self.durable_commit(user_root)?,
+        }
+
+        for (savepoint, transaction) in self.deleted_persistent_savepoints.lock().iter() {
+            self.transaction_tracker
+                .deallocate_savepoint(*savepoint, *transaction)?;
+        }
+
+        // system_freed_pages may be non-empty after a non-durable commit if system-tree
+        // page frees were deferred due to active readers. They will be processed by a
+        // future durable commit. Only assert empty for durable commits.
+        #[cfg(not(fuzzing))]
+        {
+            debug_assert!(
+                matches!(self.durability, InternalDurability::None)
+                    || self
+                        .system_tables
+                        .lock()
+                        .system_freed_pages()
+                        .lock()
+                        .is_empty()
+            );
+            debug_assert!(self.tables.lock().freed_pages.lock().is_empty());
+        }
+
+        #[cfg(feature = "logging")]
+        debug!(
+            "Finished commit of transaction id={:?}",
+            self.transaction_id
+        );
+
+        let info = crate::observer::CommitInfo {
+            transaction_id: self.transaction_id.raw_id(),
+            dirty_page_count,
+            two_phase: self.two_phase_commit,
+            #[cfg(feature = "std")]
+            commit_duration: commit_start.elapsed(),
+        };
+        self.observer.on_write_commit(&info);
+        #[cfg(feature = "metrics")]
+        self.db_metrics
+            .write_txn_committed
+            .fetch_add(1, portable_atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    fn store_data_freed_pages(&self, mut freed_pages: Vec<PageNumber>) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let mut freed_table = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
+        let mut pagination_counter = 0;
+        while !freed_pages.is_empty() {
+            let chunk_size = 400;
+            let buffer_size = PageList::required_bytes(chunk_size);
+            let key = TransactionIdWithPagination {
+                transaction_id: self.transaction_id.raw_id(),
+                pagination_id: pagination_counter,
+            };
+            let mut access_guard = freed_table.insert_reserve(&key, buffer_size)?;
+
+            let len = freed_pages.len();
+            access_guard.as_mut().clear();
+            for page in freed_pages.drain(len - min(len, chunk_size)..) {
+                // Make sure that the page is currently allocated
+                #[cfg(not(fuzzing))]
+                {
+                    debug_assert!(
+                        self.mem.is_allocated(page),
+                        "Page is not allocated: {page:?}"
+                    );
+                    debug_assert!(!self.mem.uncommitted(page), "Page is uncommitted: {page:?}");
+                }
+                access_guard.as_mut().push_back(page)?;
+            }
+
+            pagination_counter += 1;
+        }
+
+        Ok(())
+    }
+
+    fn store_allocated_pages(&self, mut data_allocated_pages: Vec<PageNumber>) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let mut allocated_table = system_tables.open_system_table(self, DATA_ALLOCATED_TABLE)?;
+        let mut pagination_counter = 0;
+        while !data_allocated_pages.is_empty() {
+            let chunk_size = 400;
+            let buffer_size = PageList::required_bytes(chunk_size);
+            let key = TransactionIdWithPagination {
+                transaction_id: self.transaction_id.raw_id(),
+                pagination_id: pagination_counter,
+            };
+            let mut access_guard = allocated_table.insert_reserve(&key, buffer_size)?;
+
+            let len = data_allocated_pages.len();
+            access_guard.as_mut().clear();
+            for page in data_allocated_pages.drain(len - min(len, chunk_size)..) {
+                // Make sure that the page is currently allocated. This is to catch scenarios like
+                // a page getting allocated, and then deallocated within the same transaction,
+                // but errantly being left in the allocated pages list
+                #[cfg(not(fuzzing))]
+                {
+                    debug_assert!(
+                        self.mem.is_allocated(page),
+                        "Page is not allocated: {page:?}"
+                    );
+                    debug_assert!(self.mem.uncommitted(page), "Page is committed: {page:?}");
+                }
+                access_guard.as_mut().push_back(page)?;
+            }
+
+            pagination_counter += 1;
+        }
+
+        // Purge any transactions that are no longer referenced
+        let oldest = self
+            .transaction_tracker
+            .oldest_savepoint()?
+            .map_or(u64::MAX, |(_, x)| x.raw_id());
+        let key = TransactionIdWithPagination {
+            transaction_id: oldest,
+            pagination_id: 0,
+        };
+        for entry in allocated_table.extract_from_if(..key, |_, _| true)? {
+            entry?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_cdc_log(&self) -> Result {
+        let events = match self.cdc_log {
+            Some(ref log) => {
+                let mut guard = log.lock();
+                if guard.is_empty() {
+                    return Ok(());
+                }
+                core::mem::take(&mut *guard)
+            }
+            None => return Ok(()),
+        };
+
+        let txn_id = self.transaction_id.raw_id();
+        let mut system_tables = self.system_tables.lock();
+        let mut cdc_table = system_tables.open_system_table(self, CDC_LOG_TABLE)?;
+
+        // CDC events are inserted into system tables before the commit point (slot swap).
+        // If any insert fails, commit_inner() returns Err and abort_inner() is called,
+        // which frees all pages in allocated_since_commit -- including these system table
+        // pages. No orphaned CDC entries survive a failed commit.
+        for (seq, event) in events.iter().enumerate() {
+            let key = CdcKey::new(txn_id, u32::try_from(seq).unwrap_or(u32::MAX));
+            let record = CdcRecord::from_event(event)?;
+            cdc_table.insert(&key, &record)?;
+        }
+
+        // Retention pruning -- respect active consumer cursors to prevent
+        // silent data loss. The effective cutoff is the LARGER of (txn_id -
+        // retention_max_txns) and the oldest cursor position, so we never
+        // prune events that a registered consumer hasn't consumed yet.
+        if self.cdc_config.retention_max_txns > 0 && txn_id > self.cdc_config.retention_max_txns {
+            let retention_cutoff = txn_id - self.cdc_config.retention_max_txns;
+
+            // Drop cdc_table to release the borrow on system_tables before
+            // opening the cursor table.
+            drop(cdc_table);
+
+            // Find the oldest active cursor position (if any cursors exist)
+            let oldest_cursor = {
+                let cursor_table = system_tables.open_system_table(self, CDC_CURSOR_TABLE)?;
+                let mut oldest: Option<u64> = None;
+                for entry in cursor_table.range::<&str>(..)? {
+                    let (_, val_guard) = entry?;
+                    let pos = val_guard.value();
+                    oldest = Some(oldest.map_or(pos, |o: u64| o.min(pos)));
+                }
+                drop(cursor_table);
+                oldest
+            };
+
+            // Don't prune past the oldest cursor -- a slow consumer would
+            // silently miss mutations if we deleted entries it hasn't read.
+            // Use min() so the cutoff never advances beyond what the slowest
+            // consumer has already read.
+            let effective_cutoff = match oldest_cursor {
+                Some(cursor_pos) => retention_cutoff.min(cursor_pos),
+                None => retention_cutoff,
+            };
+
+            if effective_cutoff > 0 {
+                let mut cdc_table = system_tables.open_system_table(self, CDC_LOG_TABLE)?;
+                let end_key = CdcKey::new(effective_cutoff, u32::MAX);
+                for entry in cdc_table.extract_from_if(..=end_key, |_, _| true)? {
+                    entry?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Advance a named CDC cursor to the given transaction ID.
+    ///
+    /// Cursors persist across transactions and allow consumers to track
+    /// their position in the CDC log. Only the named consumer should
+    /// advance its own cursor.
+    pub fn advance_cdc_cursor(&self, name: &str, up_to_txn: u64) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let mut cursor_table = system_tables.open_system_table(self, CDC_CURSOR_TABLE)?;
+        cursor_table.insert(name, &up_to_txn)?;
+        Ok(())
+    }
+
+    pub(crate) fn list_history_snapshot_ids(&self) -> Result<Vec<u64>> {
+        let mut system_tables = self.system_tables.lock();
+        let history_table = system_tables.open_system_table(self, HISTORY_TABLE)?;
+        let mut ids = Vec::new();
+        for entry in history_table.range::<u64>(..)? {
+            let (key_guard, _) = entry?;
+            ids.push(key_guard.value());
+        }
+        Ok(ids)
+    }
+
+    pub(crate) fn purge_all_history_snapshots(&self) -> Result {
+        let mut system_tables = self.system_tables.lock();
+        let mut history_table = system_tables.open_system_table(self, HISTORY_TABLE)?;
+        let keys: Vec<u64> = history_table
+            .range::<u64>(..)?
+            .map(|entry| entry.map(|(k, _)| k.value()))
+            .collect::<Result<Vec<_>>>()?;
+        for key in &keys {
+            history_table.remove(key)?;
+        }
+        Ok(())
+    }
+
+    /// Abort the transaction
+    ///
+    /// All writes performed in this transaction will be rolled back
+    pub fn abort(mut self) -> Result {
+        // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
+        self.completed = true;
+        self.abort_inner()
+    }
+
+    fn abort_inner(&mut self) -> Result {
+        #[cfg(feature = "logging")]
+        debug!("Aborting transaction id={:?}", self.transaction_id);
+        self.tables.lock().table_tree.clear_root_updates_and_close();
+        for savepoint in self.created_persistent_savepoints.lock().iter() {
+            match self.delete_persistent_savepoint(savepoint.0) {
+                Ok(_) => {}
+                Err(err) => match err {
+                    SavepointError::InvalidSavepoint => {
+                        return Err(StorageError::Internal(
+                            "invalid savepoint encountered during transaction abort".to_string(),
+                        ));
+                    }
+                    SavepointError::Storage(storage_err) => {
+                        return Err(storage_err);
+                    }
+                },
+            }
+        }
+        self.mem.rollback_uncommitted_writes()?;
+        #[cfg(feature = "logging")]
+        debug!("Finished abort of transaction id={:?}", self.transaction_id);
+
+        self.observer.on_write_abort(self.transaction_id.raw_id());
+        #[cfg(feature = "metrics")]
+        self.db_metrics
+            .write_txn_aborted
+            .fetch_add(1, portable_atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
+        // NOTE: process_freed_pages() has already run in commit_inner() before flush_and_close(),
+        // so previously freed pages are already returned to the buddy allocator.
+
+        let mut system_tables = self.system_tables.lock();
+
+        // Save history snapshot for time-travel reads.
+        // Must happen before flush_table_root_updates() so the history table
+        // changes are included in the system root.
+        if self.history_retention > 0 && !self.quick_repair {
+            #[cfg(feature = "std")]
+            #[allow(clippy::cast_possible_truncation)]
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_millis() as u64;
+            #[cfg(not(feature = "std"))]
+            let timestamp_ms = 0u64;
+
+            // With chunked blob storage, blob state is in BLOB_COUNTERS B-tree.
+            // Read counters for history snapshot.
+            let (blob_next_seq, blob_hlc) = {
+                let counters_table = system_tables.open_system_table(self, BLOB_COUNTERS)?;
+                let next_seq = counters_table
+                    .get(&BLOB_COUNTER_NEXT_SEQ)?
+                    .map_or(0, |g| g.value());
+                let hlc = counters_table
+                    .get(&BLOB_COUNTER_HLC)?
+                    .map_or(0, |g| g.value());
+                (next_seq, hlc)
+            };
+            let snapshot = HistorySnapshot::new(
+                user_root,
+                timestamp_ms,
+                0, // blob_region_offset: no longer used (chunked storage)
+                0, // blob_region_length: no longer used
+                blob_next_seq,
+                blob_hlc,
+            );
+            let mut history_table = system_tables.open_system_table(self, HISTORY_TABLE)?;
+            history_table.insert(&self.transaction_id.raw_id(), &snapshot)?;
+            self.transaction_tracker
+                .register_history_hold(self.transaction_id)?;
+
+            // Prune old snapshots beyond retention limit.
+            let mut all_keys = Vec::new();
+            for entry in history_table.range::<u64>(..)? {
+                let (key_guard, _) = entry?;
+                all_keys.push(key_guard.value());
+            }
+            let retention = usize::try_from(self.history_retention).unwrap_or(usize::MAX);
+            if all_keys.len() > retention {
+                let to_remove = all_keys.len() - retention;
+                for key in &all_keys[..to_remove] {
+                    history_table.remove(key)?;
+                    self.transaction_tracker
+                        .deallocate_history_hold(TransactionId::new(*key))?;
+                }
+            }
+        }
+
+        let system_freed_pages = system_tables.system_freed_pages();
+
+        // Drain deferred system-tree frees from a previous commit that was
+        // blocked by concurrent readers. Merge them into this commit's
+        // system_freed_pages so the pre-commit reader check (below) and
+        // SYSTEM_FREED_TABLE lifecycle handle them correctly.
+        {
+            let deferred: Vec<_> = self
+                .mem
+                .deferred_system_tree_frees
+                .lock()
+                .drain(..)
+                .collect();
+            if !deferred.is_empty() {
+                system_freed_pages.lock().extend(deferred);
+            }
+        }
+
+        let system_tree = system_tables.table_tree.flush_table_root_updates()?;
+        system_tree
+            .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+            .map_err(|e| e.into_storage_error_or_internal("Unexpected TableError"))?;
+
+        if self.quick_repair {
+            system_tree.create_table_and_flush_table_root(
+                ALLOCATOR_STATE_TABLE_NAME,
+                |system_tree_ref, tree: &mut AllocatorStateTreeMut| {
+                    // `try_save_allocator_state` answers "not yet" and "never"
+                    // with the same `false`, so this loop cannot tell a
+                    // transient miss from a permanent one. Its termination
+                    // argument was the comment below -- clearing the table
+                    // frees pages, so the retry has room -- which holds only
+                    // while every `false` is transient.
+                    //
+                    // It is not. A corrupt file whose header disagrees with its
+                    // loaded allocator state produced a `false` no retry could
+                    // ever clear, and because `Database::drop` writes this
+                    // table, the whole database hung on close: `fuzz_redb` sat
+                    // in a single input for 1766 seconds there.
+                    //
+                    // `reserve_allocator_state` now rejects that specific
+                    // disagreement up front, so this bound is the backstop
+                    // rather than the fix: no future permanent-`false`
+                    // condition should be able to hang a close again. The
+                    // legitimate cases converge in one or two passes -- the
+                    // reservation is resized to what the state actually needs
+                    // -- so exceeding this many means it is not converging.
+                    const MAX_SAVE_ATTEMPTS: usize = 64;
+
+                    let mut pagination_counter = 0;
+                    let mut attempts = 0usize;
+
+                    loop {
+                        let num_regions = self
+                            .mem
+                            .reserve_allocator_state(tree, self.transaction_id)?;
+
+                        // We can't free pages after the commit, because that would invalidate our
+                        // saved allocator state. Everything needs to go through the transactional
+                        // free mechanism
+                        self.store_system_freed_pages(
+                            system_tree_ref,
+                            system_freed_pages.clone(),
+                            None,
+                            &mut pagination_counter,
+                        )?;
+
+                        if self.mem.try_save_allocator_state(tree, num_regions)? {
+                            return Ok(());
+                        }
+
+                        attempts += 1;
+                        if attempts >= MAX_SAVE_ATTEMPTS {
+                            // Not a panic and not a retry: report it. The
+                            // allocator state table is an optimisation, so the
+                            // caller degrades rather than fails -- without it
+                            // the next open runs a full repair instead of a
+                            // quick one, which `Database::drop` already logs as
+                            // "Repair may be required at restart."
+                            return Err(StorageError::Corrupted(alloc::format!(
+                                "allocator state did not converge in {MAX_SAVE_ATTEMPTS} attempts"
+                            )));
+                        }
+
+                        // Clear out the table before retrying, just in case the number of regions
+                        // has somehow shrunk. Don't use retain_in() for this, since it doesn't
+                        // free the pages immediately -- we need to reuse those pages to guarantee
+                        // that our retry loop will eventually terminate
+                        //
+                        // This loop terminates only while `remove` actually
+                        // removes what `last` just reported. On a corrupt tree
+                        // the two disagree, `last` keeps returning the same key,
+                        // and the close never finishes -- which is where the
+                        // 1766-second `fuzz_redb` hang actually sat, one level
+                        // below the retry loop above.
+                        //
+                        // `extract_if` already guards the identical
+                        // iterate-then-delete disagreement in `btree_iters`;
+                        // this is the same check, in the same words.
+                        while let Some(guards) = tree.last()? {
+                            let key = guards.0.value();
+                            drop(guards);
+                            if tree.remove(&key)?.is_none() {
+                                return Err(StorageError::Corrupted(String::from(
+                                    "allocator state: key existed during iteration but delete returned None",
+                                )));
+                            }
+                        }
+                    }
+                },
+            )?;
+        } else {
+            // Check whether any live read transactions hold references to system-tree
+            // pages (e.g. ReadTransaction::get_blob() via open_system_btree()). If so,
+            // defer freeing through SYSTEM_FREED_TABLE until those readers complete.
+            // If no readers exist, immediate freeing after commit is safe.
+            let has_live_readers = self
+                .transaction_tracker
+                .oldest_live_read_transaction()?
+                .is_some();
+            if has_live_readers {
+                let mut pagination_counter = 0;
+                self.store_system_freed_pages(
+                    system_tree,
+                    system_freed_pages.clone(),
+                    None,
+                    &mut pagination_counter,
+                )?;
+                // Pages have been deferred into SYSTEM_FREED_TABLE; drain the
+                // original list so the immediate-free loop below is a no-op.
+                system_freed_pages.lock().clear();
+            }
+        }
+
+        let system_root = system_tree.finalize_dirty_checksums()?;
+
+        self.mem.commit(
+            user_root,
+            system_root,
+            self.transaction_id,
+            self.two_phase_commit,
+            self.shrink_policy,
+        )?;
+
+        // Mark any pending non-durable commits as fully committed.
+        self.transaction_tracker
+            .clear_pending_non_durable_commits()?;
+
+        // Post-commit: re-check for live readers before freeing system-tree pages.
+        // A reader may have registered between the pre-commit check and
+        // mem.commit(), holding a reference to the old system tree. If so,
+        // defer freeing until the next durable commit when those readers close.
+        let remaining: Vec<_> = system_freed_pages.lock().drain(..).collect();
+        if !remaining.is_empty() {
+            let has_old_readers = self
+                .transaction_tracker
+                .oldest_live_read_transaction()?
+                .is_some_and(|oldest| oldest < self.transaction_id);
+            if has_old_readers {
+                self.mem.deferred_system_tree_frees.lock().extend(remaining);
+            } else {
+                for page in remaining {
+                    self.mem.free(page, &mut PageTrackerPolicy::Ignore)?;
+                }
+            }
+        }
+
+        // Drain deferred non-durable frees. After a durable commit, all old
+        // non-durable snapshots are superseded and no reader can reference
+        // those pages.
+        for page in self.mem.deferred_nondurable_frees.lock().drain(..) {
+            if self.mem.unpersisted(page) {
+                self.mem.free(page, &mut PageTrackerPolicy::Ignore)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Commit without a durability guarantee
+    pub(crate) fn non_durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
+        // Use oldest_live_read_transaction_excluding_nondurable to find real
+        // external readers (from begin_read / savepoints), ignoring the synthetic
+        // durable-ancestor holds added by register_non_durable_commit. This
+        // prevents freeing pages that real concurrent readers might traverse,
+        // while still allowing eager reclamation when no external readers exist.
+        let mut free_until_transaction = self
+            .transaction_tracker
+            .oldest_live_read_transaction_excluding_nondurable()?
+            .map(|x| x.next())
+            .transpose()?
+            .unwrap_or(self.transaction_id);
+        if let Some((_, oldest_savepoint)) = self.transaction_tracker.oldest_savepoint()? {
+            free_until_transaction = TransactionId::min(free_until_transaction, oldest_savepoint);
+        }
+        self.process_freed_pages_nondurable(free_until_transaction)?;
+
+        // Also drain any deferred system-tree frees from a previous commit that
+        // was blocked by concurrent readers. Re-check: if those readers have
+        // since closed, free now; otherwise re-defer.
+        let mut still_deferred = vec![];
+        {
+            let mut deferred = self.mem.deferred_nondurable_frees.lock();
+            if !deferred.is_empty() {
+                let pages = mem::take(&mut *deferred);
+                drop(deferred);
+                let has_old_readers = self
+                    .transaction_tracker
+                    .oldest_live_read_transaction_excluding_nondurable()?
+                    .is_some();
+                if has_old_readers {
+                    still_deferred = pages;
+                } else {
+                    for page in pages {
+                        if self.mem.unpersisted(page) {
+                            self.mem.free(page, &mut PageTrackerPolicy::Ignore)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drain deferred system-tree frees from a previous durable commit.
+        // These are persisted pages. If no readers reference the old snapshot,
+        // free immediately; otherwise re-defer for the next durable commit.
+        {
+            let pages: Vec<_> = self
+                .mem
+                .deferred_system_tree_frees
+                .lock()
+                .drain(..)
+                .collect();
+            if !pages.is_empty() {
+                let has_old_readers = self
+                    .transaction_tracker
+                    .oldest_live_read_transaction_excluding_nondurable()?
+                    .is_some();
+                if has_old_readers {
+                    self.mem.deferred_system_tree_frees.lock().extend(pages);
+                } else {
+                    for page in pages {
+                        self.mem.free(page, &mut PageTrackerPolicy::Ignore)?;
+                    }
+                }
+            }
+        }
+
+        let mut post_commit_frees = vec![];
+
+        let system_root = {
+            let mut system_tables = self.system_tables.lock();
+            let system_freed_pages = system_tables.system_freed_pages();
+            system_tables.table_tree.flush_table_root_updates()?;
+            for page in system_freed_pages
+                .lock()
+                .extract_if(.., |p| self.mem.unpersisted(*p))
+            {
+                post_commit_frees.push(page);
+            }
+            // Store all freed pages for a future commit(), since we can't free pages during a
+            // non-durable commit (it's non-durable, so could be rolled back anytime in the future)
+            self.store_system_freed_pages(
+                &mut system_tables.table_tree,
+                system_freed_pages,
+                Some(&mut post_commit_frees),
+                &mut 0,
+            )?;
+
+            system_tables
+                .table_tree
+                .flush_table_root_updates()?
+                .finalize_dirty_checksums()?
+        };
+
+        self.mem
+            .non_durable_commit(user_root, system_root, self.transaction_id)?;
+        // Register this as a non-durable transaction to ensure that the freed pages we just pushed
+        // are only processed after this has been persisted
+        self.transaction_tracker.register_non_durable_commit(
+            self.transaction_id,
+            self.mem.get_last_durable_transaction_id()?,
+        )?;
+
+        // Post-commit safety check: the secondary slot now holds our transaction
+        // ID, so any new begin_read() opens at self.transaction_id and uses the
+        // NEW system tree. Only readers registered BEFORE our non_durable_commit()
+        // could be traversing the old system-tree pages in post_commit_frees.
+        // This check is race-free: after the secondary slot update, no new reader
+        // can register at the old snapshot.
+        if !post_commit_frees.is_empty() || !still_deferred.is_empty() {
+            post_commit_frees.extend(still_deferred);
+            let has_old_readers = self
+                .transaction_tracker
+                .oldest_live_read_transaction_excluding_nondurable()?
+                .is_some_and(|oldest| oldest < self.transaction_id);
+            if has_old_readers {
+                self.mem
+                    .deferred_nondurable_frees
+                    .lock()
+                    .extend(post_commit_frees);
+            } else {
+                for page in post_commit_frees {
+                    self.mem.free(page, &mut PageTrackerPolicy::Ignore)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Relocate pages to lower number regions/pages
+    // Returns true if a page(s) was moved
+    pub(crate) fn compact_pages(&mut self) -> Result<bool> {
+        let mut progress = false;
+
+        // Find the 1M highest pages
+        let mut highest_pages = BTreeMap::new();
+        let mut tables = self.tables.lock();
+        let table_tree = &mut tables.table_tree;
+        table_tree.highest_index_pages(MAX_PAGES_PER_COMPACTION, &mut highest_pages)?;
+        let mut system_tables = self.system_tables.lock();
+        let system_table_tree = &mut system_tables.table_tree;
+        system_table_tree.highest_index_pages(MAX_PAGES_PER_COMPACTION, &mut highest_pages)?;
+
+        // Calculate how many of them can be relocated to lower pages, starting from the last page
+        let mut relocation_map = HashMap::new();
+        for path in highest_pages.into_values().rev() {
+            if relocation_map.contains_key(&path.page_number()) {
+                continue;
+            }
+            let old_page = self.mem.get_page(path.page_number())?;
+            let mut new_page = self.mem.allocate_lowest(old_page.memory().len())?;
+            let new_page_number = new_page.get_page_number();
+            // We have to copy at least the page type into the new page.
+            // Otherwise its cache priority will be calculated incorrectly
+            new_page.memory_mut()?[0] = old_page.memory()[0];
+            drop(new_page);
+            // We're able to move this to a lower page, so insert it and rewrite all its parents
+            if new_page_number < path.page_number() {
+                relocation_map.insert(path.page_number(), new_page_number);
+                for parent in path.parents() {
+                    if relocation_map.contains_key(parent) {
+                        continue;
+                    }
+                    let old_parent = self.mem.get_page(*parent)?;
+                    let mut new_page = self.mem.allocate_lowest(old_parent.memory().len())?;
+                    let new_page_number = new_page.get_page_number();
+                    // We have to copy at least the page type into the new page.
+                    // Otherwise its cache priority will be calculated incorrectly
+                    new_page.memory_mut()?[0] = old_parent.memory()[0];
+                    drop(new_page);
+                    relocation_map.insert(*parent, new_page_number);
+                }
+            } else {
+                self.mem
+                    .free(new_page_number, &mut PageTrackerPolicy::Ignore)?;
+                break;
+            }
+        }
+
+        if !relocation_map.is_empty() {
+            progress = true;
+        }
+
+        table_tree.relocate_tables(&relocation_map)?;
+        system_table_tree.relocate_tables(&relocation_map)?;
+
+        Ok(progress)
+    }
+
+    // NOTE: must be called before store_system_freed_pages() during commit, since this can create
+    // more pages freed by the current transaction
+    fn process_freed_pages(&mut self, free_until: TransactionId) -> Result {
+        // We assume below that PageNumber is length 8
+        assert_eq!(PageNumber::serialized_size(), 8);
+
+        let mut system_tables = self.system_tables.lock();
+
+        // Handle the data freed tree
+        {
+            let mut data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
+            let key = TransactionIdWithPagination {
+                transaction_id: free_until.raw_id(),
+                pagination_id: 0,
+            };
+            for entry in data_freed.extract_from_if(..key, |_, _| true)? {
+                let (_, page_list) = entry?;
+                for i in 0..page_list.value().len() {
+                    self.mem
+                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore)?;
+                }
+            }
+        }
+
+        // Handle the system freed tree
+        {
+            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
+            let key = TransactionIdWithPagination {
+                transaction_id: free_until.raw_id(),
+                pagination_id: 0,
+            };
+            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
+                let (_, page_list) = entry?;
+                for i in 0..page_list.value().len() {
+                    self.mem
+                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_freed_pages_nondurable_helper(
+        &mut self,
+        free_until: TransactionId,
+        definition: SystemTableDefinition<TransactionIdWithPagination, PageList>,
+    ) -> Result<Vec<TransactionId>> {
+        let mut processed = vec![];
+        let mut system_tables = self.system_tables.lock();
+
+        let last_key = TransactionIdWithPagination {
+            transaction_id: free_until.raw_id(),
+            pagination_id: 0,
+        };
+        let oldest_unprocessed = self
+            .transaction_tracker
+            .oldest_unprocessed_non_durable_commit()?
+            .map_or(free_until.raw_id(), |x| x.raw_id());
+        let first_key = TransactionIdWithPagination {
+            transaction_id: oldest_unprocessed,
+            pagination_id: 0,
+        };
+        let mut data_freed = system_tables.open_system_table(self, definition)?;
+
+        let mut candidate_transactions = vec![];
+        for entry in data_freed.range(first_key..last_key)? {
+            let (key, _) = entry?;
+            let transaction_id = TransactionId::new(key.value().transaction_id);
+            if self
+                .transaction_tracker
+                .is_unprocessed_non_durable_commit(transaction_id)?
+            {
+                candidate_transactions.push(transaction_id);
+            }
+        }
+        for transaction_id in candidate_transactions {
+            let mut key = TransactionIdWithPagination {
+                transaction_id: transaction_id.raw_id(),
+                pagination_id: 0,
+            };
+            loop {
+                let Some(entry) = data_freed.get(&key)? else {
+                    break;
+                };
+                let pages = entry.value();
+                let mut new_pages = vec![];
+                for i in 0..pages.len() {
+                    let page = pages.get(i);
+                    if !self
+                        .mem
+                        .free_if_unpersisted(page, &mut PageTrackerPolicy::Ignore)?
+                    {
+                        new_pages.push(page);
+                    }
+                }
+                if new_pages.len() != pages.len() {
+                    drop(entry);
+                    if new_pages.is_empty() {
+                        data_freed.remove(&key)?;
+                    } else {
+                        let required = PageList::required_bytes(new_pages.len());
+                        let mut page_list_mut = data_freed.insert_reserve(&key, required)?;
+                        for page in new_pages {
+                            page_list_mut.as_mut().push_back(page)?;
+                        }
+                    }
+                }
+                key.pagination_id += 1;
+            }
+            processed.push(transaction_id);
+        }
+
+        Ok(processed)
+    }
+
+    // NOTE: must be called before store_system_freed_pages() during commit, since this can create
+    // more pages freed by the current transaction
+    //
+    // This method only frees pages that are unpersisted, in non-durable transactions, since
+    // it is called from a non-durable commit() and therefore can't modify anything that the
+    // on-disk state in the last durable transaction might reference.
+    fn process_freed_pages_nondurable(&mut self, free_until: TransactionId) -> Result {
+        // We assume below that PageNumber is length 8
+        assert_eq!(PageNumber::serialized_size(), 8);
+
+        // Handle the data freed tree
+        let mut processed =
+            self.process_freed_pages_nondurable_helper(free_until, DATA_FREED_TABLE)?;
+
+        // Handle the system freed tree
+        processed
+            .extend(self.process_freed_pages_nondurable_helper(free_until, SYSTEM_FREED_TABLE)?);
+
+        for transaction_id in processed {
+            self.transaction_tracker
+                .mark_non_durable_commit_processed(transaction_id)?;
+        }
+
+        Ok(())
+    }
+
+    fn store_system_freed_pages(
+        &self,
+        system_tree: &mut TableTreeMut,
+        system_freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        mut unpersisted_pages: Option<&mut Vec<PageNumber>>,
+        pagination_counter: &mut u64,
+    ) -> Result {
+        assert_eq!(PageNumber::serialized_size(), 8); // We assume below that PageNumber is length 8
+
+        system_tree.open_table_and_flush_table_root(
+            SYSTEM_FREED_TABLE.name(),
+            |system_freed_tree: &mut SystemFreedTree| {
+                while !system_freed_pages.lock().is_empty() {
+                    let chunk_size = 200;
+                    let buffer_size = PageList::required_bytes(chunk_size);
+                    let key = TransactionIdWithPagination {
+                        transaction_id: self.transaction_id.raw_id(),
+                        pagination_id: *pagination_counter,
+                    };
+                    let mut access_guard = system_freed_tree.insert_reserve(&key, buffer_size)?;
+
+                    let mut freed_pages = system_freed_pages.lock();
+                    let len = freed_pages.len();
+                    access_guard.as_mut().clear();
+                    for page in freed_pages.drain(len - min(len, chunk_size)..) {
+                        if let Some(ref mut unpersisted_pages) = unpersisted_pages
+                            && self.mem.unpersisted(page)
+                        {
+                            unpersisted_pages.push(page);
+                        } else {
+                            access_guard.as_mut().push_back(page)?;
+                        }
+                    }
+                    drop(access_guard);
+
+                    *pagination_counter += 1;
+                }
+                Ok(())
+            },
+        )?;
+
+        Ok(())
+    }
+
+    /// Retrieves information about storage usage in the database
+    pub fn stats(&self) -> Result<DatabaseStats> {
+        let tables = self.tables.lock();
+        let table_tree = &tables.table_tree;
+        let data_tree_stats = table_tree.stats()?;
+
+        let system_tables = self.system_tables.lock();
+        let system_table_tree = &system_tables.table_tree;
+        let system_tree_stats = system_table_tree.stats()?;
+
+        let total_metadata_bytes = data_tree_stats.metadata_bytes()
+            + system_tree_stats.metadata_bytes
+            + system_tree_stats.stored_leaf_bytes;
+        let total_fragmented = data_tree_stats.fragmented_bytes()
+            + system_tree_stats.fragmented_bytes
+            + self.mem.count_free_pages()? * (self.mem.get_page_size() as u64);
+
+        Ok(DatabaseStats {
+            tree_height: data_tree_stats.tree_height(),
+            allocated_pages: self.mem.count_allocated_pages()?,
+            free_pages: self.mem.count_free_pages()?,
+            trailing_free_pages: self.mem.trailing_free_pages()?,
+            leaf_pages: data_tree_stats.leaf_pages(),
+            branch_pages: data_tree_stats.branch_pages(),
+            stored_leaf_bytes: data_tree_stats.stored_bytes(),
+            metadata_bytes: total_metadata_bytes,
+            fragmented_bytes: total_fragmented,
+            page_size: self.mem.get_page_size(),
+        })
+    }
+
+    #[allow(dead_code)]
+    #[cfg(feature = "std")]
+    pub(crate) fn print_debug(&self) -> Result {
+        // Flush any pending updates to make sure we get the latest root
+        let mut tables = self.tables.lock();
+        if let Some(page) = tables
+            .table_tree
+            .flush_table_root_updates()?
+            .finalize_dirty_checksums()?
+        {
+            eprintln!("Master tree:");
+            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new_uncompressed(
+                Some(page),
+                PageHint::None,
+                self.transaction_guard.clone(),
+                self.mem.clone(),
+            )?;
+            master_tree.print_debug(true)?;
+        }
+
+        // Flush any pending updates to make sure we get the latest root
+        let mut system_tables = self.system_tables.lock();
+        if let Some(page) = system_tables
+            .table_tree
+            .flush_table_root_updates()?
+            .finalize_dirty_checksums()?
+        {
+            eprintln!("System tree:");
+            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new_uncompressed(
+                Some(page),
+                PageHint::None,
+                self.transaction_guard.clone(),
+                self.mem.clone(),
+            )?;
+            master_tree.print_debug(true)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for WriteTransaction {
+    fn drop(&mut self) {
+        let is_panicking = {
+            #[cfg(feature = "std")]
+            {
+                std::thread::panicking()
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                false
+            }
+        };
+        if !self.completed && !is_panicking && !self.mem.storage_failure() {
+            #[allow(unused_variables)]
+            if let Err(error) = self.abort_inner() {
+                #[cfg(feature = "logging")]
+                warn!("Failure automatically aborting transaction: {error}");
+            }
+        } else if !self.completed && self.mem.storage_failure() {
+            self.tables.lock().table_tree.clear_root_updates_and_close();
+        }
+    }
+}
+
+/// A read-only transaction
+///
+/// Read-only transactions may exist concurrently with writes
+pub struct ReadTransaction {
+    mem: Arc<TransactionalMemory>,
+    tree: TableTree,
+    /// System root captured at transaction creation time. Readers must use this
+    /// instead of `mem.get_system_root()` to ensure MVCC consistency -- the live
+    /// system root advances with each writer commit, and reading it at call time
+    /// would give a root whose pages may have been freed and reallocated.
+    system_root: Option<BtreeHeader>,
+    transaction_id: Option<u64>,
+    observer: crate::observer::ObserverRef,
+    #[cfg(feature = "metrics")]
+    db_metrics: Arc<crate::observer::DbMetrics>,
+}
+
+impl ReadTransaction {
+    pub(crate) fn new(
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+        observer: crate::observer::ObserverRef,
+        #[cfg(feature = "metrics")] db_metrics: Arc<crate::observer::DbMetrics>,
+    ) -> Result<Self, TransactionError> {
+        let root_page = mem.get_data_root();
+        let system_root = mem.get_system_root();
+        let txn_id = guard.id().ok().map(|id| id.raw_id());
+        let guard = Arc::new(guard);
+        Ok(Self {
+            mem: mem.clone(),
+            tree: TableTree::new(root_page, PageHint::Clean, guard, mem)
+                .map_err(TransactionError::Storage)?,
+            system_root,
+            transaction_id: txn_id,
+            observer,
+            #[cfg(feature = "metrics")]
+            db_metrics,
+        })
+    }
+
+    /// Create a read transaction that reads from a historical `user_root` snapshot.
+    pub(crate) fn new_historical(
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+        user_root: Option<BtreeHeader>,
+        observer: crate::observer::ObserverRef,
+        #[cfg(feature = "metrics")] db_metrics: Arc<crate::observer::DbMetrics>,
+    ) -> Result<Self, TransactionError> {
+        let system_root = mem.get_system_root();
+        let txn_id = guard.id().ok().map(|id| id.raw_id());
+        let guard = Arc::new(guard);
+        Ok(Self {
+            mem: mem.clone(),
+            tree: TableTree::new(user_root, PageHint::Clean, guard, mem)
+                .map_err(TransactionError::Storage)?,
+            system_root,
+            transaction_id: txn_id,
+            observer,
+            #[cfg(feature = "metrics")]
+            db_metrics,
+        })
+    }
+
+    pub(crate) fn table_tree(&self) -> &TableTree {
+        &self.tree
+    }
+
+    /// Open the given table
+    pub fn open_table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<ReadOnlyTable<K, V>, TableError> {
+        let header = self
+            .tree
+            .get_table::<K, V>(definition.name(), TableType::Normal)?
+            .ok_or_else(|| TableError::TableDoesNotExist(definition.name().to_string()))?;
+
+        match header {
+            InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
+                definition.name().to_string(),
+                table_root,
+                PageHint::Clean,
+                self.tree.transaction_guard().clone(),
+                self.mem.clone(),
+            )?),
+            InternalTableDefinition::Multimap { .. } => {
+                Err(TableError::Storage(StorageError::Internal(
+                    "unexpected multimap table type when opening normal table".to_string(),
+                )))
+            }
+        }
+    }
+
+    /// Open a TTL-enabled table for reading.
+    ///
+    /// Returns an error if the table does not exist.
+    #[cfg(feature = "std")]
+    pub fn open_ttl_table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: crate::ttl_table::TtlTableDefinition<K, V>,
+    ) -> Result<crate::ttl_table::ReadOnlyTtlTable<K, V>, TableError> {
+        let inner = self.open_table(definition.inner_def())?;
+        Ok(crate::ttl_table::ReadOnlyTtlTable::new(inner))
+    }
+
+    /// Open an IVF-PQ vector index for reading.
+    ///
+    /// Returns an error if the index does not exist.
+    pub fn open_ivfpq_index(
+        &self,
+        definition: &crate::ivfpq::config::IvfPqIndexDefinition,
+    ) -> Result<crate::ivfpq::index::ReadOnlyIvfPqIndex, TableError> {
+        crate::ivfpq::index::ReadOnlyIvfPqIndex::open(
+            self,
+            definition,
+            #[cfg(feature = "metrics")]
+            Arc::clone(&self.db_metrics),
+        )
+        .map_err(TableError::Storage)
+    }
+
+    /// Open the given table without a type
+    pub fn open_untyped_table(
+        &self,
+        handle: impl TableHandle,
+    ) -> Result<ReadOnlyUntypedTable, TableError> {
+        let header = self
+            .tree
+            .get_table_untyped(handle.name(), TableType::Normal)?
+            .ok_or_else(|| TableError::TableDoesNotExist(handle.name().to_string()))?;
+
+        match header {
+            InternalTableDefinition::Normal {
+                table_root,
+                fixed_key_size,
+                fixed_value_size,
+                ..
+            } => Ok(ReadOnlyUntypedTable::new(
+                table_root,
+                fixed_key_size,
+                fixed_value_size,
+                self.mem.clone(),
+            )),
+            InternalTableDefinition::Multimap { .. } => {
+                Err(TableError::Storage(StorageError::Internal(
+                    "unexpected multimap table type when opening untyped normal table".to_string(),
+                )))
+            }
+        }
+    }
+
+    /// Open the given table
+    pub fn open_multimap_table<K: Key + 'static, V: Key + 'static>(
+        &self,
+        definition: MultimapTableDefinition<K, V>,
+    ) -> Result<ReadOnlyMultimapTable<K, V>, TableError> {
+        let header = self
+            .tree
+            .get_table::<K, V>(definition.name(), TableType::Multimap)?
+            .ok_or_else(|| TableError::TableDoesNotExist(definition.name().to_string()))?;
+
+        match header {
+            InternalTableDefinition::Normal { .. } => {
+                Err(TableError::Storage(StorageError::Internal(
+                    "unexpected normal table type when opening multimap table".to_string(),
+                )))
+            }
+            InternalTableDefinition::Multimap {
+                table_root,
+                table_length,
+                ..
+            } => Ok(ReadOnlyMultimapTable::new(
+                table_root,
+                table_length,
+                PageHint::Clean,
+                self.tree.transaction_guard().clone(),
+                self.mem.clone(),
+            )?),
+        }
+    }
+
+    /// Open the given table without a type
+    pub fn open_untyped_multimap_table(
+        &self,
+        handle: impl MultimapTableHandle,
+    ) -> Result<ReadOnlyUntypedMultimapTable, TableError> {
+        let header = self
+            .tree
+            .get_table_untyped(handle.name(), TableType::Multimap)?
+            .ok_or_else(|| TableError::TableDoesNotExist(handle.name().to_string()))?;
+
+        match header {
+            InternalTableDefinition::Normal { .. } => {
+                Err(TableError::Storage(StorageError::Internal(
+                    "unexpected normal table type when opening untyped multimap table".to_string(),
+                )))
+            }
+            InternalTableDefinition::Multimap {
+                table_root,
+                table_length,
+                fixed_key_size,
+                fixed_value_size,
+                ..
+            } => Ok(ReadOnlyUntypedMultimapTable::new(
+                table_root,
+                table_length,
+                fixed_key_size,
+                fixed_value_size,
+                self.mem.clone(),
+            )),
+        }
+    }
+
+    /// List all the tables
+    pub fn list_tables(&self) -> Result<impl Iterator<Item = UntypedTableHandle>> {
+        self.tree
+            .list_tables(TableType::Normal)
+            .map(|x| x.into_iter().map(UntypedTableHandle::new))
+    }
+
+    /// List all the multimap tables
+    pub fn list_multimap_tables(&self) -> Result<impl Iterator<Item = UntypedMultimapTableHandle>> {
+        self.tree
+            .list_tables(TableType::Multimap)
+            .map(|x| x.into_iter().map(UntypedMultimapTableHandle::new))
+    }
+
+    /// Open a read-only B-tree over a system table.
+    ///
+    /// Returns `None` if the system table does not exist (e.g. no blobs stored yet).
+    fn open_system_btree<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: SystemTableDefinition<K, V>,
+    ) -> Result<Option<Btree<K, V>>> {
+        let system_root = self.system_root;
+        let system_tree = TableTree::new(
+            system_root,
+            PageHint::Clean,
+            self.tree.transaction_guard().clone(),
+            self.mem.clone(),
+        )?;
+
+        let header = system_tree.get_table::<K, V>(definition.name(), TableType::Normal);
+        match header {
+            Ok(Some(InternalTableDefinition::Normal { table_root, .. })) => {
+                let btree = Btree::new_uncompressed(
+                    table_root,
+                    PageHint::Clean,
+                    self.tree.transaction_guard().clone(),
+                    self.mem.clone(),
+                )?;
+                Ok(Some(btree))
+            }
+            Ok(Some(InternalTableDefinition::Multimap { .. })) => Err(StorageError::Internal(
+                "unexpected multimap table type in system table lookup".to_string(),
+            )),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                Err(e.into_storage_error_or_internal("Internal error: blob system table corrupted"))
+            }
+        }
+    }
+
+    /// Read all chunks for a blob sequence from the read-only `BLOB_CHUNKS` btree.
+    fn read_blob_chunks(&self, source_sequence: u64, expected_length: u64) -> Result<Vec<u8>> {
+        let Some(chunks_btree) = self.open_system_btree(BLOB_CHUNKS)? else {
+            return Err(StorageError::Corrupted(alloc::format!(
+                "blob seq {source_sequence}: BLOB_CHUNKS table missing"
+            )));
+        };
+
+        let start = BlobChunkKey::new(source_sequence, 0);
+        let end = BlobChunkKey::new(source_sequence, u32::MAX);
+        let range = chunks_btree
+            .range::<core::ops::RangeInclusive<BlobChunkKey>, BlobChunkKey>(&(start..=end))?;
+
+        let mut buf = Vec::with_capacity(blob_prealloc(expected_length));
+        for entry in range {
+            let entry = entry?;
+            buf.extend_from_slice(entry.value());
+        }
+        if buf.len() as u64 != expected_length {
+            return Err(StorageError::Corrupted(alloc::format!(
+                "blob seq {}: expected {} bytes, assembled {}",
+                source_sequence,
+                expected_length,
+                buf.len()
+            )));
+        }
+        Ok(buf)
+    }
+
+    /// Read a byte range from blob chunks (read-only path).
+    #[allow(clippy::cast_possible_truncation)]
+    fn read_blob_chunk_range_ro(
+        &self,
+        source_sequence: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let Some(chunks_btree) = self.open_system_btree(BLOB_CHUNKS)? else {
+            return Err(StorageError::Corrupted(alloc::format!(
+                "blob seq {source_sequence}: BLOB_CHUNKS table missing"
+            )));
+        };
+
+        let chunk_size = BLOB_CHUNK_SIZE as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let start_chunk = (offset / chunk_size) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let end_chunk = ((offset + length).saturating_sub(1) / chunk_size) as u32;
+
+        let start_key = BlobChunkKey::new(source_sequence, start_chunk);
+        let end_key = BlobChunkKey::new(source_sequence, end_chunk);
+        let range = chunks_btree.range::<core::ops::RangeInclusive<BlobChunkKey>, BlobChunkKey>(
+            &(start_key..=end_key),
+        )?;
+
+        let mut buf = Vec::with_capacity(blob_prealloc(length));
+        let mut global_pos = u64::from(start_chunk) * chunk_size;
+        for entry in range {
+            let entry = entry?;
+            let chunk_data = entry.value();
+            let chunk_end = global_pos + chunk_data.len() as u64;
+
+            let read_start = offset.max(global_pos);
+            let read_end = (offset + length).min(chunk_end);
+            if read_start < read_end {
+                let local_start = (read_start - global_pos) as usize;
+                let local_end = (read_end - global_pos) as usize;
+                buf.extend_from_slice(&chunk_data[local_start..local_end]);
+            }
+            global_pos = chunk_end;
+        }
+        Ok(buf)
+    }
+
+    pub(crate) fn read_blob_chunks_into(
+        &self,
+        source_sequence: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result {
+        let table = self
+            .open_system_btree(BLOB_CHUNKS)?
+            .ok_or_else(|| StorageError::Corrupted("BLOB_CHUNKS table missing".into()))?;
+        crate::blob_store::reader::copy_chunks(offset, output, |index, local, part| {
+            let key = BlobChunkKey::new(source_sequence, index);
+            let guard = table.get(&key)?.ok_or_else(|| {
+                StorageError::Corrupted(alloc::format!("blob chunk {index} missing"))
+            })?;
+            crate::blob_store::reader::copy_chunk(guard.value(), local, part)
+        })
+    }
+
+    /// Look up a single history snapshot by transaction ID (read-only).
+    pub(crate) fn get_history_snapshot_ro(
+        &self,
+        transaction_id: u64,
+    ) -> Result<Option<HistorySnapshot>> {
+        let Some(btree) = self.open_system_btree(HISTORY_TABLE)? else {
+            return Ok(None);
+        };
+        Ok(btree.get(&transaction_id)?.map(|guard| guard.value()))
+    }
+
+    /// List all retained history snapshot IDs in ascending order (read-only).
+    pub(crate) fn list_history_snapshot_ids_ro(&self) -> Result<Vec<u64>> {
+        let Some(btree) = self.open_system_btree(HISTORY_TABLE)? else {
+            return Ok(Vec::new());
+        };
+        let mut ids = Vec::new();
+        for entry in btree.range::<core::ops::RangeFull, u64>(&(..))? {
+            let guard = entry?;
+            ids.push(guard.key());
+        }
+        Ok(ids)
+    }
+
+    /// Retrieve a blob's data and metadata by ID.
+    ///
+    /// The returned data is verified against the stored xxh3-128 checksum.
+    pub fn get_blob(&self, blob_id: &BlobId) -> Result<Option<(Vec<u8>, BlobMeta)>> {
+        let Some(btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(None);
+        };
+
+        let Some(guard) = btree.get(blob_id)? else {
+            return Ok(None);
+        };
+        let meta = guard.value();
+
+        if meta.blob_ref.length == 0 {
+            return Ok(Some((Vec::new(), meta)));
+        }
+
+        let source_seq = if meta.blob_ref.offset == u64::MAX {
+            blob_id.sequence
+        } else {
+            meta.blob_ref.offset
+        };
+        let data = self.read_blob_chunks(source_seq, meta.blob_ref.length)?;
+
+        let actual = xxh3_hash128(&data);
+        if actual != meta.blob_ref.checksum {
+            return Err(StorageError::BlobChecksumMismatch {
+                sequence: blob_id.sequence,
+                expected: meta.blob_ref.checksum,
+                actual,
+            });
+        }
+
+        Ok(Some((data, meta)))
+    }
+
+    /// Retrieve only a blob's metadata (no data read).
+    pub fn get_blob_meta(&self, blob_id: &BlobId) -> Result<Option<BlobMeta>> {
+        let Some(btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(None);
+        };
+
+        Ok(btree.get(blob_id)?.map(|g| g.value()))
+    }
+
+    /// Look up a blob by its sequence number.
+    ///
+    /// IVF-PQ indexes store vector IDs as `u64` sequence numbers. This method
+    /// resolves a sequence number back to the full `(BlobId, BlobMeta)` pair by
+    /// performing a range scan on the blob table from `BlobId::new(seq, 0)` to
+    /// `BlobId::new(seq, u64::MAX)`.
+    ///
+    /// Returns the first matching blob, or `None` if no blob has that sequence.
+    pub fn blob_by_sequence(&self, seq: u64) -> Result<Option<(BlobId, BlobMeta)>> {
+        let Some(btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(None);
+        };
+
+        let start = BlobId::new(seq, 0);
+        let end = BlobId::new(seq, u64::MAX);
+        let mut range = btree.range::<core::ops::RangeInclusive<BlobId>, BlobId>(&(start..=end))?;
+        match range.next() {
+            Some(entry) => {
+                let entry = entry?;
+                Ok(Some((entry.key(), entry.value())))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Start building a composite multi-signal query.
+    ///
+    /// Fuses vector similarity, temporal recency, and causal proximity into
+    /// a single ranked result set. See [`CompositeQuery`](crate::composite::CompositeQuery)
+    /// for the full builder API.
+    pub fn composite_query(&self) -> crate::composite::CompositeQuery<'_> {
+        crate::composite::CompositeQuery::new(self)
+    }
+
+    /// Read a byte range from a blob without checksum verification.
+    ///
+    /// Returns `None` if the blob does not exist. Returns
+    /// [`StorageError::BlobRangeOutOfBounds`] if `offset + length` exceeds the
+    /// blob's total size.
+    pub fn read_blob_range(
+        &self,
+        blob_id: &BlobId,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(None);
+        };
+
+        let Some(guard) = btree.get(blob_id)? else {
+            return Ok(None);
+        };
+        let meta = guard.value();
+
+        if length == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let end = offset.saturating_add(length);
+        if end > meta.blob_ref.length {
+            return Err(StorageError::BlobRangeOutOfBounds {
+                blob_length: meta.blob_ref.length,
+                requested_offset: offset,
+                requested_length: length,
+            });
+        }
+
+        let source_seq = if meta.blob_ref.offset == u64::MAX {
+            blob_id.sequence
+        } else {
+            meta.blob_ref.offset
+        };
+        let data = self.read_blob_chunk_range_ro(source_seq, offset, length)?;
+
+        Ok(Some(data))
+    }
+
+    /// Open a lazy reader pinned to this transaction's snapshot. Opening reads
+    /// metadata only; subsequent reads do not verify the whole-blob checksum.
+    pub fn blob_reader(&self, blob_id: &BlobId) -> Result<Option<BlobReader<'_>>> {
+        let Some(meta) = self.get_blob_meta(blob_id)? else {
+            return Ok(None);
+        };
+        let source_seq = if meta.blob_ref.offset == u64::MAX {
+            blob_id.sequence
+        } else {
+            meta.blob_ref.offset
+        };
+        Ok(Some(BlobReader::from_read(
+            self,
+            source_seq,
+            meta.blob_ref.length,
+        )))
+    }
+
+    /// Query deduplication statistics.
+    ///
+    /// Scans the dedup index and returns the number of unique content entries,
+    /// total reference count across all entries, and estimated bytes saved by dedup.
+    /// Returns zeroed stats if dedup has never been used.
+    pub fn dedup_stats(&self) -> Result<DedupStats> {
+        let Some(btree) = self.open_system_btree(BLOB_DEDUP_INDEX)? else {
+            return Ok(DedupStats {
+                total_dedup_entries: 0,
+                total_ref_count: 0,
+                bytes_saved: 0,
+            });
+        };
+
+        let mut total_dedup_entries: u64 = 0;
+        let mut total_ref_count: u64 = 0;
+        let mut bytes_saved: u64 = 0;
+
+        let range = btree.range::<RangeFull, Sha256Key>(&(..))?;
+        for entry in range {
+            let entry = entry?;
+            let val = entry.value();
+            total_dedup_entries += 1;
+            total_ref_count += u64::from(val.ref_count);
+            // Each extra reference beyond the first saves `length` bytes
+            if val.ref_count > 1 {
+                bytes_saved += val.length * u64::from(val.ref_count - 1);
+            }
+        }
+
+        Ok(DedupStats {
+            total_dedup_entries,
+            total_ref_count,
+            bytes_saved,
+        })
+    }
+
+    /// Returns statistics about blob store usage.
+    ///
+    /// With chunked B-tree storage, there is no separate blob region and no
+    /// fragmentation. `region_bytes` equals `live_bytes`, `dead_bytes` is 0.
+    pub fn blob_stats(&self) -> Result<BlobStats> {
+        let Some(btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(BlobStats {
+                blob_count: 0,
+                live_bytes: 0,
+                region_bytes: 0,
+                dead_bytes: 0,
+                fragmentation_ratio: 0.0,
+            });
+        };
+
+        let mut blob_count: u64 = 0;
+        let mut live_bytes: u64 = 0;
+
+        let range = btree.range::<RangeFull, BlobId>(&(..))?;
+        for entry in range {
+            let entry = entry?;
+            let meta = entry.value();
+            blob_count += 1;
+            // Only count physical storage: blobs with offset == u64::MAX own their
+            // chunks. Dedup references share chunks and don't add physical bytes.
+            if meta.blob_ref.offset == u64::MAX {
+                live_bytes += meta.blob_ref.length;
+            }
+        }
+
+        Ok(BlobStats {
+            blob_count,
+            live_bytes,
+            region_bytes: live_bytes,
+            dead_bytes: 0,
+            fragmentation_ratio: 0.0,
+        })
+    }
+
+    /// Query blobs within a wall-clock time range (nanoseconds).
+    ///
+    /// Returns `(TemporalKey, BlobMeta)` pairs ordered by timestamp.
+    /// Complexity: O(log N + K) where K is the number of results.
+    /// Returns an empty vec if `start_ns > end_ns`.
+    pub fn blobs_in_time_range(
+        &self,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Result<Vec<(TemporalKey, BlobMeta)>> {
+        if start_ns > end_ns {
+            return Ok(Vec::new());
+        }
+        let Some(temporal_btree) = self.open_system_btree(BLOB_TEMPORAL_INDEX)? else {
+            return Ok(Vec::new());
+        };
+        let Some(blob_btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(Vec::new());
+        };
+
+        let start = TemporalKey::range_start(start_ns);
+        let end = TemporalKey::range_end(end_ns);
+        let range = temporal_btree.range(&(start..=end))?;
+
+        let mut results = Vec::new();
+        for entry in range {
+            let entry = entry?;
+            let temporal_key = entry.key();
+            if let Some(meta_guard) = blob_btree.get(&temporal_key.blob_id)? {
+                results.push((temporal_key, meta_guard.value()));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Find blobs near a reference blob within a time window.
+    ///
+    /// Looks up the reference blob's timestamp, then scans +/-`window_ns`/2.
+    /// Used for sensor fusion queries ("all inputs within 100ms of X").
+    pub fn blobs_near(
+        &self,
+        reference: &BlobId,
+        window_ns: u64,
+    ) -> Result<Vec<(TemporalKey, BlobMeta)>> {
+        let Some(blob_btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(Vec::new());
+        };
+
+        let Some(guard) = blob_btree.get(reference)? else {
+            return Ok(Vec::new());
+        };
+        let ref_meta = guard.value();
+
+        let half_window = window_ns / 2;
+        let start_ns = ref_meta.wall_clock_ns.saturating_sub(half_window);
+        let end_ns = ref_meta.wall_clock_ns.saturating_add(half_window);
+
+        self.blobs_in_time_range(start_ns, end_ns)
+    }
+
+    /// Traverse the causal chain backwards from a blob.
+    ///
+    /// Follows `causal_parent` links up to `max_hops` steps.
+    /// Returns blobs from newest to oldest (starting with the given blob).
+    /// The `Option<CausalEdge>` is the edge from the blob's parent to itself
+    /// (`None` for the root of the chain or if no edge metadata exists).
+    pub fn causal_chain(
+        &self,
+        blob_id: &BlobId,
+        max_hops: usize,
+    ) -> Result<Vec<(BlobId, BlobMeta, Option<CausalEdge>)>> {
+        let Some(blob_btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(Vec::new());
+        };
+
+        let edges_btree = self.open_system_btree(BLOB_CAUSAL_EDGES)?;
+        let legacy_btree = self.open_system_btree(BLOB_CAUSAL_CHILDREN)?;
+
+        let mut chain = Vec::new();
+        let mut current = *blob_id;
+
+        for _ in 0..=max_hops {
+            let Some(g) = blob_btree.get(&current)? else {
+                break;
+            };
+            let meta = g.value();
+            let parent = meta.causal_parent;
+
+            // Look up the edge from parent -> current
+            let edge = if let Some(parent_id) = parent {
+                Self::lookup_causal_edge(
+                    &parent_id,
+                    &current,
+                    edges_btree.as_ref(),
+                    legacy_btree.as_ref(),
+                )?
+            } else {
+                None
+            };
+
+            chain.push((current, meta, edge));
+            match parent {
+                Some(p) => current = p,
+                None => break,
+            }
+        }
+
+        Ok(chain)
+    }
+
+    /// Get all direct causal children of a blob, with edge metadata.
+    ///
+    /// The v2 causal edges index uses a composite `(parent, child)` key,
+    /// supporting multiple children per parent (branching causal graphs).
+    pub fn causal_children(&self, blob_id: &BlobId) -> Result<Vec<CausalEdge>> {
+        // Try v2 edges table (supports multiple children per parent)
+        if let Some(edges_btree) = self.open_system_btree(BLOB_CAUSAL_EDGES)? {
+            let start_key = CausalEdgeKey::new(*blob_id, BlobId::MIN);
+            let end_key = CausalEdgeKey::new(*blob_id, BlobId::MAX);
+            let mut children = Vec::new();
+            let range = edges_btree.range(&(start_key..=end_key))?;
+            for entry in range {
+                let entry = entry?;
+                children.push(entry.value());
+            }
+            if !children.is_empty() {
+                return Ok(children);
+            }
+        }
+
+        // Fall back to legacy table
+        if let Some(legacy_btree) = self.open_system_btree(BLOB_CAUSAL_CHILDREN)?
+            && let Some(g) = legacy_btree.get(blob_id)?
+        {
+            return Ok(vec![CausalEdge::legacy(g.value())]);
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Find a causal path between two blobs via backward traversal.
+    ///
+    /// Walks from `to` toward `from` via `causal_parent` links.
+    /// Returns the path including both endpoints with edge metadata,
+    /// or `None` if no path exists within `max_depth` hops.
+    /// The `Option<CausalEdge>` is the edge from parent to the node
+    /// (`None` for the `from` endpoint which has no incoming edge).
+    pub fn causal_path(
+        &self,
+        from: &BlobId,
+        to: &BlobId,
+        max_depth: usize,
+    ) -> Result<Option<CausalPath>> {
+        if from == to {
+            return Ok(Some(vec![(*from, None)]));
+        }
+
+        let Some(blob_btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(None);
+        };
+
+        let edges_btree = self.open_system_btree(BLOB_CAUSAL_EDGES)?;
+        let legacy_btree = self.open_system_btree(BLOB_CAUSAL_CHILDREN)?;
+
+        // path stores (blob_id, edge from parent->this)
+        let mut path: CausalPath = Vec::new();
+        let mut current = *to;
+        // We'll fill in edges as we walk backward; the `to` node has an edge from its parent
+        for _ in 0..max_depth {
+            let Some(g) = blob_btree.get(&current)? else {
+                break;
+            };
+            let meta = g.value();
+            let Some(parent) = meta.causal_parent else {
+                break;
+            };
+
+            // Edge from parent -> current
+            let edge = Self::lookup_causal_edge(
+                &parent,
+                &current,
+                edges_btree.as_ref(),
+                legacy_btree.as_ref(),
+            )?;
+            path.push((current, edge));
+
+            if parent == *from {
+                path.push((*from, None));
+                path.reverse();
+                return Ok(Some(path));
+            }
+            current = parent;
+        }
+
+        Ok(None)
+    }
+
+    /// Look up a causal edge by (parent, child) composite key, checking v2 table then legacy.
+    fn lookup_causal_edge(
+        parent: &BlobId,
+        child: &BlobId,
+        edges_btree: Option<&Btree<CausalEdgeKey, CausalEdge>>,
+        legacy_btree: Option<&Btree<BlobId, BlobId>>,
+    ) -> Result<Option<CausalEdge>> {
+        if let Some(bt) = edges_btree {
+            let key = CausalEdgeKey::new(*parent, *child);
+            if let Some(g) = bt.get(&key)? {
+                return Ok(Some(g.value()));
+            }
+        }
+        if let Some(bt) = legacy_btree
+            && let Some(g) = bt.get(parent)?
+        {
+            return Ok(Some(CausalEdge::legacy(g.value())));
+        }
+        Ok(None)
+    }
+
+    /// Get all blobs with a given tag.
+    ///
+    /// Uses a prefix range scan on the tag index for O(log N + K) performance
+    /// where K is the number of matching blobs.
+    pub fn blobs_by_tag(&self, tag: &str) -> Result<Vec<BlobId>> {
+        let Some(tag_btree) = self.open_system_btree(BLOB_TAG_INDEX)? else {
+            return Ok(Vec::new());
+        };
+
+        let start = TagKey::range_start(tag);
+        let end = TagKey::range_end(tag);
+        let range = tag_btree.range(&(start..=end))?;
+
+        let mut results = Vec::new();
+        for entry in range {
+            let entry = entry?;
+            results.push(entry.key().blob_id);
+        }
+        Ok(results)
+    }
+
+    /// Get all blobs in a namespace, with their metadata.
+    ///
+    /// Uses the namespace index for efficient prefix scanning.
+    pub fn blobs_in_namespace(&self, namespace: &str) -> Result<Vec<(BlobId, BlobMeta)>> {
+        let Some(ns_idx_btree) = self.open_system_btree(BLOB_NAMESPACE_INDEX)? else {
+            return Ok(Vec::new());
+        };
+        let Some(blob_btree) = self.open_system_btree(BLOB_TABLE)? else {
+            return Ok(Vec::new());
+        };
+
+        let start = NamespaceKey::range_start(namespace);
+        let end = NamespaceKey::range_end(namespace);
+        let range = ns_idx_btree.range(&(start..=end))?;
+
+        let mut results = Vec::new();
+        for entry in range {
+            let entry = entry?;
+            let blob_id = entry.key().blob_id;
+            if let Some(meta_guard) = blob_btree.get(&blob_id)? {
+                results.push((blob_id, meta_guard.value()));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Query blobs within a time range, optionally filtered by namespace.
+    ///
+    /// When `namespace` is `Some`, only blobs belonging to that namespace are
+    /// included. When `None`, behaves identically to `blobs_in_time_range`.
+    pub fn blobs_in_time_range_ns(
+        &self,
+        start_ns: u64,
+        end_ns: u64,
+        namespace: Option<&str>,
+    ) -> Result<Vec<(TemporalKey, BlobMeta)>> {
+        let results = self.blobs_in_time_range(start_ns, end_ns)?;
+        let Some(ns) = namespace else {
+            return Ok(results);
+        };
+
+        let Some(ns_btree) = self.open_system_btree(BLOB_NAMESPACE)? else {
+            return Ok(Vec::new());
+        };
+
+        let mut filtered = Vec::new();
+        for (tk, meta) in results {
+            if let Some(ns_guard) = ns_btree.get(&tk.blob_id)?
+                && ns_guard.value().namespace_str() == ns
+            {
+                filtered.push((tk, meta));
+            }
+        }
+        Ok(filtered)
+    }
+
+    /// Get tags for a blob.
+    pub fn blob_tags(&self, blob_id: &BlobId) -> Result<Vec<String>> {
+        let Some(tag_btree) = self.open_system_btree(BLOB_TAG_INDEX)? else {
+            return Ok(Vec::new());
+        };
+
+        // TagKey is ordered (tag, blob_id), so we must do a full scan to find
+        // all tags for a given blob_id. Acceptable because the tag index is
+        // typically small.
+        let start = TagKey::new("", BlobId::MIN);
+        let end = TagKey {
+            tag: [0xFF; 32],
+            tag_len: 32,
+            blob_id: BlobId::MAX,
+        };
+        let range = tag_btree.range(&(start..=end))?;
+        let mut tags = Vec::new();
+        for entry in range {
+            let entry = entry?;
+            let key = entry.key();
+            if key.blob_id == *blob_id {
+                tags.push(key.tag_str().to_string());
+            }
+        }
+        Ok(tags)
+    }
+
+    /// Get namespace for a blob.
+    pub fn blob_namespace(&self, blob_id: &BlobId) -> Result<Option<String>> {
+        let Some(ns_btree) = self.open_system_btree(BLOB_NAMESPACE)? else {
+            return Ok(None);
+        };
+
+        match ns_btree.get(blob_id)? {
+            Some(g) => Ok(Some(g.value().namespace_str().to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Read CDC changes committed after the given transaction ID.
+    ///
+    /// Returns all change records with `transaction_id > after_txn_id`,
+    /// ordered by `(transaction_id, sequence)`. Returns an empty vec if
+    /// CDC has never been used or if there are no newer changes.
+    pub fn read_cdc_since(&self, after_txn_id: u64) -> Result<Vec<ChangeStream>> {
+        let Some(btree) = self.open_system_btree(CDC_LOG_TABLE)? else {
+            return Ok(Vec::new());
+        };
+
+        // Detect if the cursor is behind the retention window.
+        // If the oldest retained entry is newer than the requested position,
+        // entries have been pruned and the consumer may have missed changes.
+        if after_txn_id > 0 {
+            let mut all_range = btree.range::<core::ops::RangeFull, CdcKey>(&(..))?;
+            if let Some(first) = all_range.next() {
+                let first = first?;
+                let oldest_txn = first.key().transaction_id;
+                if oldest_txn > after_txn_id.saturating_add(1) {
+                    return Err(StorageError::CdcCursorBehindRetention {
+                        cursor_txn_id: after_txn_id,
+                        oldest_retained_txn_id: oldest_txn,
+                    });
+                }
+            }
+        }
+
+        let start = CdcKey::new(after_txn_id.saturating_add(1), 0);
+        let end = CdcKey::new(u64::MAX, u32::MAX);
+        let range = btree.range::<core::ops::RangeInclusive<CdcKey>, CdcKey>(&(start..=end))?;
+
+        let mut results = Vec::new();
+        for entry in range {
+            let entry = entry?;
+            let record = CdcRecord::deserialize(entry.value_data())?;
+            results.push(ChangeStream::from_key_record(entry.key(), record));
+        }
+        Ok(results)
+    }
+
+    /// Read CDC changes within a transaction ID range (inclusive on both ends).
+    ///
+    /// Returns all change records where `start_txn <= transaction_id <= end_txn`,
+    /// ordered by `(transaction_id, sequence)`.
+    pub fn read_cdc_range(&self, start_txn: u64, end_txn: u64) -> Result<Vec<ChangeStream>> {
+        if start_txn > end_txn {
+            return Ok(Vec::new());
+        }
+        let Some(btree) = self.open_system_btree(CDC_LOG_TABLE)? else {
+            return Ok(Vec::new());
+        };
+
+        // Detect if the requested range start is behind the retention window.
+        if start_txn > 0 {
+            let mut all_range = btree.range::<core::ops::RangeFull, CdcKey>(&(..))?;
+            if let Some(first) = all_range.next() {
+                let first = first?;
+                let oldest_txn = first.key().transaction_id;
+                if oldest_txn > start_txn {
+                    return Err(StorageError::CdcCursorBehindRetention {
+                        cursor_txn_id: start_txn,
+                        oldest_retained_txn_id: oldest_txn,
+                    });
+                }
+            }
+        }
+
+        let start = CdcKey::new(start_txn, 0);
+        let end = CdcKey::new(end_txn, u32::MAX);
+        let range = btree.range::<core::ops::RangeInclusive<CdcKey>, CdcKey>(&(start..=end))?;
+
+        let mut results = Vec::new();
+        for entry in range {
+            let entry = entry?;
+            let record = CdcRecord::deserialize(entry.value_data())?;
+            results.push(ChangeStream::from_key_record(entry.key(), record));
+        }
+        Ok(results)
+    }
+
+    /// Read the position of a named CDC cursor.
+    ///
+    /// Returns the transaction ID that the named consumer has processed up to,
+    /// or `None` if the cursor has never been set.
+    pub fn cdc_cursor(&self, name: &str) -> Result<Option<u64>> {
+        let Some(btree) = self.open_system_btree(CDC_CURSOR_TABLE)? else {
+            return Ok(None);
+        };
+        match btree.get(&name)? {
+            Some(guard) => Ok(Some(guard.value())),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the transaction ID of the latest CDC log entry, or `None` if empty.
+    pub fn latest_cdc_transaction_id(&self) -> Result<Option<u64>> {
+        let Some(btree) = self.open_system_btree(CDC_LOG_TABLE)? else {
+            return Ok(None);
+        };
+        let mut range = btree.range::<core::ops::RangeFull, CdcKey>(&(..))?;
+        match range.next_back() {
+            Some(entry) => {
+                let entry = entry?;
+                Ok(Some(entry.key().transaction_id))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Close the transaction
+    ///
+    /// Transactions are automatically closed when they and all objects referencing them have been dropped,
+    /// so this method does not normally need to be called.
+    /// This method can be used to ensure that there are no outstanding objects remaining.
+    ///
+    /// Returns `ReadTransactionStillInUse` error if a table or other object retrieved from the transaction still references this transaction
+    pub fn close(self) -> Result<(), TransactionError> {
+        if Arc::strong_count(self.tree.transaction_guard()) > 1 {
+            return Err(TransactionError::ReadTransactionStillInUse(Box::new(self)));
+        }
+        // No-op, just drop ourself
+        Ok(())
+    }
+}
+
+impl Drop for ReadTransaction {
+    fn drop(&mut self) {
+        if let Some(id) = self.transaction_id {
+            self.observer.on_read_end(id);
+            #[cfg(feature = "metrics")]
+            self.db_metrics
+                .read_txn_closed
+                .fetch_add(1, portable_atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Debug for ReadTransaction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ReadTransaction")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// storage_traits::StorageWrite for WriteTransaction
+// ---------------------------------------------------------------------------
+
+impl crate::storage_traits::StorageWrite for WriteTransaction {
+    type Table<'txn, K: Key + 'static, V: Value + 'static>
+        = Table<'txn, K, V>
+    where
+        Self: 'txn;
+
+    fn open_storage_table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Self::Table<'_, K, V>> {
+        self.open_table(definition)
+            .map_err(|e| e.into_storage_error_or_internal("open_storage_table"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// storage_traits::StorageRead for ReadTransaction
+// ---------------------------------------------------------------------------
+
+impl crate::storage_traits::StorageRead for ReadTransaction {
+    type Table<'txn, K: Key + 'static, V: Value + 'static>
+        = ReadOnlyTable<K, V>
+    where
+        Self: 'txn;
+
+    fn open_storage_table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Self::Table<'_, K, V>> {
+        self.open_table(definition)
+            .map_err(|e| e.into_storage_error_or_internal("open_storage_table"))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+
+    const X: TableDefinition<&str, &str> = TableDefinition::new("x");
+
+    /// `PageList::len` reads a u16 straight off a B-tree page. `get` then
+    /// slices `data[start..start + 8]`, which panics outright if that length
+    /// outruns the buffer. `visit_freed_tree` walks this during `do_repair` --
+    /// on a database already known to be damaged -- so a panic here turns a
+    /// partial recovery into no recovery at all.
+    #[test]
+    fn page_list_len_is_bounded_by_its_buffer() {
+        use crate::transactions::PageList;
+        use crate::types::Value;
+
+        // Claim 1000 entries but supply room for only two.
+        let mut data = Vec::new();
+        data.extend(1000u16.to_le_bytes());
+        data.extend([0u8; 16]);
+
+        let list = <PageList as Value>::from_bytes(&data);
+        assert_eq!(
+            list.len(),
+            2,
+            "len must be clamped to what the buffer can hold"
+        );
+        // Every index below len() must be readable without panicking.
+        for i in 0..list.len() {
+            let _ = list.get(i);
+        }
+    }
+
+    /// A blob length read off disk must not drive an unbounded reservation:
+    /// allocation failure aborts the process rather than unwinding, so no
+    /// caller could turn it into an error.
+    #[test]
+    fn blob_prealloc_is_bounded() {
+        use crate::transactions::{MAX_BLOB_PREALLOC, blob_prealloc};
+
+        let cap = usize::try_from(MAX_BLOB_PREALLOC).unwrap();
+
+        // Ordinary lengths are reserved exactly.
+        assert_eq!(blob_prealloc(0), 0);
+        assert_eq!(blob_prealloc(4096), 4096);
+        assert_eq!(blob_prealloc(MAX_BLOB_PREALLOC), cap);
+
+        // A corrupted length is capped, not honoured.
+        for absurd in [MAX_BLOB_PREALLOC + 1, 1 << 40, u64::MAX] {
+            assert_eq!(blob_prealloc(absurd), cap, "length {absurd} must be capped");
+        }
+    }
+
+    /// `AllocatorStateKey::from_bytes` read `data[0]` before checking the
+    /// length: "index out of bounds: the len is 0 but the index is 0". Found by
+    /// the `fuzz_db_image` target. The unknown-discriminant arm already
+    /// degraded rather than panicking; only the length check was missing.
+    #[test]
+    fn allocator_state_key_from_empty_bytes_does_not_panic() {
+        use crate::transactions::AllocatorStateKey;
+        use crate::types::Value;
+
+        // Must return, not panic.
+        let key = <AllocatorStateKey as Value>::from_bytes(&[]);
+        assert_eq!(key, AllocatorStateKey::Deprecated);
+
+        // An unknown discriminant degrades the same way.
+        assert_eq!(
+            <AllocatorStateKey as Value>::from_bytes(&[99, 0, 0, 0, 0]),
+            AllocatorStateKey::Deprecated
+        );
+    }
+
+    #[test]
+    fn transaction_id_persistence() {
+        let tmpfile = crate::create_tempfile();
+        let db = Database::create(tmpfile.path()).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(X).unwrap();
+            table.insert("hello", "world").unwrap();
+        }
+        let first_txn_id = write_txn.transaction_id;
+        write_txn.commit().unwrap();
+        drop(db);
+
+        let db2 = Database::create(tmpfile.path()).unwrap();
+        let write_txn = db2.begin_write().unwrap();
+        assert!(write_txn.transaction_id > first_txn_id);
+    }
+
+    const Y: TableDefinition<u64, &[u8]> = TableDefinition::new("y");
+
+    #[test]
+    fn savepoint_restore_then_commit() {
+        let tmpfile = crate::create_tempfile();
+        let db = Database::create(tmpfile.path()).unwrap();
+
+        // Seed the table with enough data to force multiple page allocations
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(Y).unwrap();
+            let value = vec![0xABu8; 512];
+            for i in 0..200u64 {
+                table.insert(&i, value.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+
+        // Repeated savepoint-restore cycles to stress page allocator
+        for round in 0..10u64 {
+            let mut txn = db.begin_write().unwrap();
+            let savepoint = txn.ephemeral_savepoint().unwrap();
+            {
+                let mut table = txn.open_table(Y).unwrap();
+                let big_value = vec![0xCDu8; 2048];
+                for i in 0..100u64 {
+                    let key = 10_000 + round * 100 + i;
+                    table.insert(&key, big_value.as_slice()).unwrap();
+                }
+            }
+            txn.restore_savepoint(&savepoint).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Verify none of the throwaway keys were persisted
+        let rtxn = db.begin_read().unwrap();
+        let table = rtxn.open_table(Y).unwrap();
+        assert_eq!(table.len().unwrap(), 200);
+        for i in 0..10u64 {
+            for j in 0..100u64 {
+                let key = 10_000 + i * 100 + j;
+                assert!(
+                    table.get(&key).unwrap().is_none(),
+                    "key {key} should not exist"
+                );
+            }
+        }
+    }
+}

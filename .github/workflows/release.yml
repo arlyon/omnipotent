@@ -1,0 +1,31 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Explicitly authorize a release PR or publication
+        type: choice
+        options: [release-pr, release]
+        default: release-pr
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+jobs:
+  release-plz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: release-plz/action@038b3bb42de75ac07329d69e588c76d35563f038 # v0.5
+        with:
+          command: ${{ inputs.command }}
+        env:
+          # A PAT can trigger the binary workflow on publication. With github.token,
+          # dispatch Packer binaries manually with the resulting release tag.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}

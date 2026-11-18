@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 390" fill="none">
+  <title>Local storage and a separate power base connect to the main board</title>
+  <path fill="#ece9e3" d="M0 0h360v390H0z"/>
+  <g stroke="#a69d94"><path fill="#f6f3ec" d="M131 20h66l31 29v40h-97Z"/><path d="M197 20v29h31M145 34h7m5 0h7m5 0h7"/><rect x="43" y="146" width="274" height="108" rx="4" fill="#f6f3ec"/><rect x="64" y="168" width="74" height="59" rx="2" fill="#e1dbd2"/><rect x="209" y="160" width="88" height="22" rx="2"/><rect x="209" y="190" width="88" height="22" rx="2"/><rect x="209" y="220" width="88" height="22" rx="2"/><path d="M138 184h33v-13h38m-38 13v48h38m-38-31h38"/></g>
+  <path stroke="#a69d94" d="M180 112v34"/>
+  <path stroke="#bc2821" stroke-dasharray="4 5" d="M180 254v42"/>
+  <rect x="104" y="296" width="152" height="57" rx="4" stroke="#a69d94" stroke-dasharray="4 5"/>
+  <g fill="#ded8ce" stroke="#8c8379"><rect x="124" y="311" width="31" height="27" rx="9"/><rect x="165" y="311" width="31" height="27" rx="9"/><rect x="206" y="311" width="31" height="27" rx="9"/></g>
+  <g fill="#40372f" font-family="Arial,sans-serif" text-anchor="middle"><text x="180" y="108" font-size="14">Local library</text><text x="101" y="202" font-size="13">Compute</text><text x="253" y="176" font-size="11">E-paper</text><text x="253" y="205" font-size="10">Wi-Fi / Bluetooth</text><text x="253" y="235" font-size="11">LoRa</text><text x="180" y="277" font-size="14">Main board</text><text x="180" y="376" font-size="14">Power base</text></g>
+</svg>

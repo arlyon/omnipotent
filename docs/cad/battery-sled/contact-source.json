@@ -1,0 +1,18 @@
+{
+  "manufacturer": "Mill-Max",
+  "part_number": "0906-0-15-20-76-14-11-0",
+  "mounting": "Through-hole solder tail; not a solder-cup or press-fit part",
+  "product_page": "https://www.mill-max.com/products/pin/0906",
+  "manufacturer_variant_data": "https://www.mill-max.com/products/detail/list/0906",
+  "drawing": "https://www.mill-max.com/sites/default/files/external/products/fullsize/2020-02/0906-0.svg",
+  "stock_page": "https://www.mill-max.com/products/check-stock?partnumber=0906015207614110",
+  "observed_lifecycle": "Active",
+  "observed_stock": "Manufacturer lists distributor stock including Digi-Key and Mouser; not a live stock guarantee",
+  "max_contact_resistance_milliohms": 20,
+  "mid_stroke_mm_from_dimensioned_drawing": 0.4953,
+  "full_stroke_mm": 0.9906,
+  "mid_stroke_force_grams": 60,
+  "manufacturer_max_current_A_at_30C_temperature_rise": 8,
+  "manufacturer_20_percent_derated_current_A": 6.4,
+  "prototype_caution": "Manufacturer current ratings are not the rating of this enclosure or harness. Confirm assembled temperature rise, wire size, fault protection and source drawing tolerances before use."
+}

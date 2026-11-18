@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="An open offline library for medical references, scientific papers, maps, books, and practical manuals. Knowledge you can take with you.">
+  <meta name="theme-color" content="#f6f5f2">
+  <title>Omnipotent · Knowledge, kept close.</title>
+  <link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+  <link rel="preload" href="assets/fonts/RedHatDisplay-Medium.otf" as="font" type="font/otf" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">{"imports":{"three":"./assets/vendor/three/three.module.min.js","three/addons/":"./assets/vendor/three/addons/"}}</script>
+  <script type="module" src="js/site.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="wordmark" href="#" aria-label="Omnipotent home"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 25V7h6v12h5V7h6v12h5V7h2v18H4Z"/></svg>omnipotent<span class="wordmark-dot">.</span></a>
+    <nav aria-label="Main navigation"><a href="#library">Library</a><a href="#access">Use it</a><a href="#protocols">Protocols</a><a href="#system">Hardware</a></nav>
+    <span class="project-status"><i aria-hidden="true"></i> In development</span>
+  </header>
+  <main id="main">
+    <div class="field-story" id="story">
+      <aside class="product-stage" aria-label="Omnipotent concept assembly">
+        <div class="stage-top"><span class="eyebrow">Field / System</span><span class="stage-index">Scroll to explore</span></div>
+        <div class="product-viewport" id="product-viewport">
+          <div class="red-field" aria-hidden="true"><span class="field-cross cross-one">+</span><span class="field-cross cross-two">+</span></div>
+          <picture><source media="(prefers-reduced-motion: reduce)" srcset="assets/images/model-ready.webp"><img class="model-fallback" id="model-fallback" src="assets/images/model-poster.webp" width="1000" height="1200" alt="Red and porcelain Omnipotent concept with a black LoRa antenna and a removable three-cell power base." fetchpriority="high"></picture>
+          <div class="model-host" id="model-host" aria-hidden="true"></div>
+          <p class="visually-hidden" id="model-instructions">Drag to rotate the model. Arrow keys turn and tilt it; Home resets the view. On touchscreens, drag sideways to turn and swipe vertically to scroll the page.</p>
+          <button class="inspection-reset" id="reset-view" type="button" hidden>Reset view <span aria-hidden="true">↺</span></button>
+          <div class="collection-orbit" id="collection-orbit" aria-hidden="true" hidden>
+            <div class="orbit-bubble" data-bubble="wikipedia"><span class="bubble-symbol wiki-symbol">W</span><span>Wikipedia</span></div>
+            <div class="orbit-bubble" data-bubble="maps"><span class="bubble-symbol"><svg viewBox="0 0 32 32"><path d="m5 7 7-3 8 3 7-3v21l-7 3-8-3-7 3Z M12 4v21 M20 7v21 M8 17l5-6 7 9 4-7"/></svg></span><span>Street maps</span></div>
+            <div class="orbit-bubble" data-bubble="medicine"><span class="bubble-symbol"><svg viewBox="0 0 32 32"><path d="M5 7h9l2 3 2-3h9v20h-9l-2 2-2-2H5Z M16 10v19 M8 12h4 M8 16h4 M20 12h4 M20 16h4"/></svg></span><span>Medical wiki</span></div>
+            <div class="orbit-bubble" data-bubble="science"><span class="bubble-symbol"><svg viewBox="0 0 32 32"><path d="M12 4h8 M14 4v10L6 26q-1 2 2 2h16q3 0 2-2L18 14V4 M11 19h10 M13 23h1 M20 25h1"/></svg></span><span>Science</span></div>
+            <div class="orbit-bubble" data-bubble="manuals"><span class="bubble-symbol"><svg viewBox="0 0 32 32"><path d="M9 4h15v24H7V6q0-2 2-2Z M9 24h15 M12 9h8 M12 13h8 M12 17h5"/></svg></span><span>Manuals</span></div>
+            <div class="orbit-bubble" data-bubble="books"><span class="bubble-symbol"><svg viewBox="0 0 32 32"><path d="M5 6q7-2 11 2 4-4 11-2v20q-7-2-11 2-4-4-11-2Z M16 8v20"/></svg></span><span>Books</span></div>
+          </div>
+          <div class="stage-caption"><span class="caption-line"></span><span>Removable power base</span></div>
+        </div>
+        <div class="stage-bottom">
+          <span id="model-status" class="small-text" role="status">3D model</span>
+          <div class="assembly-controls" hidden>
+            <button class="text-control" id="assembly-toggle" type="button" aria-pressed="false">Insert base <span aria-hidden="true">↙</span></button>
+            <button class="motion-control" id="motion-toggle" type="button" aria-pressed="false" aria-label="Pause scroll-linked animation"><span aria-hidden="true">Ⅱ</span></button>
+          </div>
+        </div>
+      </aside>
+      <div class="story-copy">
+        <section class="story-chapter intro" data-chapter="0" aria-labelledby="hero-title">
+          <p class="eyebrow"><span class="tiny-cross" aria-hidden="true">+</span> An open offline library</p>
+          <h1 id="hero-title">A library.<br>Wherever.</h1>
+          <p class="hero-lede">Keep the useful things within reach.</p>
+          <p>Medical references, scientific papers, maps, books, and practical guides. Stored on a device you can take with you.</p>
+          <a class="button" href="#library">Explore the library <span aria-hidden="true">↓</span></a>
+          <div class="hero-note"><span class="status-dot" aria-hidden="true"></span><span>Open hardware. Open formats.</span></div>
+        </section>
+        <section class="collection-chapter" id="library" aria-labelledby="library-title">
+          <header class="collection-intro">
+            <p class="eyebrow">The library / 01</p>
+            <h2 id="library-title">Choose what<br>comes with you.</h2>
+            <p>Scroll to see the collections load.</p>
+            <details class="collection-notes" id="preview-details" data-dialog-label="The library"><summary>About this preview</summary><p>These are example collections for the device. Sources and editions will be selected for release; the animation shows the idea, not a live download.</p></details>
+          </header>
+          <div class="collection-progress"><span id="collection-count">6 example collections</span><a href="#collection-end">Skip to the full library ↓</a></div>
+          <article class="collection-step" id="collection-wikipedia" data-collection="wikipedia">
+            <p class="eyebrow">01 / Wikipedia</p><h3>Follow your curiosity.</h3>
+            <p>Articles, pictures, and links into almost any subject. An encyclopedia that travels with you.</p>
+            <img class="collection-graphic" src="assets/graphics/reference.svg" width="560" height="200" alt="An article layout with contents, an illustration, and source links." loading="lazy">
+          </article>
+          <article class="collection-step" id="collection-maps" data-collection="maps">
+            <p class="eyebrow">02 / Street maps</p><h3>Find your way offline.</h3>
+            <p>Keep the streets, terrain, and routes for the places you’re going.</p>
+            <img class="collection-graphic" src="assets/graphics/map-route.svg" width="560" height="200" alt="An illustrative map with a route from a starting point to a saved destination." loading="lazy">
+          </article>
+          <article class="collection-step" id="collection-medicine" data-collection="medicine">
+            <p class="eyebrow">03 / Medical wiki</p><h3>Keep a reference nearby.</h3>
+            <p>Medical encyclopedias with sources and revision dates, available without a connection.</p>
+            <details class="collection-notes" id="medical-details" data-dialog-label="Medical references"><summary>Sources and editions</summary><p>The medical collection is still to be selected. Its authors, publication dates, and source references belong with every entry.</p></details>
+          </article>
+          <article class="collection-step" id="collection-science" data-collection="science">
+            <p class="eyebrow">04 / Medical journals &amp; science</p><h3>Read the original research.</h3>
+            <p>Open-access papers and journals, with their citations, publication dates, and corrections.</p>
+            <span class="collection-format">Medical literature · Science · Engineering</span>
+          </article>
+          <article class="collection-step" id="collection-manuals" data-collection="manuals">
+            <p class="eyebrow">05 / Technical manuals</p><h3>Keep the instructions.</h3>
+            <p>Repair guides, service manuals, diagrams, and datasheets. The right revision for the thing in front of you.</p>
+            <img class="collection-graphic" src="assets/graphics/repair-guide.svg" width="560" height="200" alt="A simple assembly drawing separating a housing, insert, and fastener." loading="lazy">
+          </article>
+          <article class="collection-step" id="collection-books" data-collection="books">
+            <p class="eyebrow">06 / Books &amp; reference</p><h3>Bring a shelf of your own.</h3>
+            <p>Books and manuals to browse locally or copy to a compatible reader.</p>
+            <span class="collection-format">EPUB and PDF · OPDS book catalogue</span>
+          </article>
+          <div class="collection-end" id="collection-end">
+            <p class="eyebrow">The full library</p><h3>Six collections.<br>Room for more.</h3>
+            <p>Keep audio, video, maps, printable parts, and editable CAD alongside the reading.</p>
+            <p>Semantic search finds related passages across the entire corpus, even when the wording differs.</p>
+            <div class="screen-frame collection-screen"><epaper-display id="collection-display" state="ready"><span>Six example collections. Enable JavaScript to preview the display.</span></epaper-display></div>
+          </div>
+        </section>
+        <section class="story-chapter" data-chapter="1" aria-labelledby="take-title">
+          <p class="eyebrow">Take a copy / 02</p>
+          <h2 id="take-title">Load your reader.<br>Keep reading.</h2>
+          <p>Browse over local Wi-Fi, or copy selected books and manuals to your own device.</p>
+          <img class="transfer-graphic" src="assets/graphics/reader-transfer.svg" width="640" height="260" alt="Choose books on Omnipotent, then take a copy on a compatible e-reader." loading="lazy">
+          <a class="inline-link" href="#kindle-details">Kindle and reader compatibility <span aria-hidden="true">↗</span></a>
+        </section>
+        <section class="story-chapter rest-chapter" data-chapter="2" aria-labelledby="rest-title">
+          <p class="eyebrow">Leave it asleep / 03</p>
+          <h2 id="rest-title">Switch off the server.<br>Keep your copy.</h2>
+          <p>The files you’ve copied stay on your reader. Omnipotent stays off until you wake it with the magnetic key.</p>
+          <figure class="story-photo"><img src="assets/images/rest-800.webp" srcset="assets/images/rest-480.webp 480w, assets/images/rest-800.webp 800w" sizes="(min-width:1000px) 35vw, 90vw" width="800" height="533" alt="The red and white device mounted beside a cabin bunk, with its display showing sleep mode." loading="lazy"><figcaption>Cabin mounting concept.</figcaption></figure>
+          <p>Designed for a year between charges.</p>
+          <details class="collection-notes" id="battery-estimate" data-dialog-label="Battery life" data-dialog-title="A year between charges.">
+            <summary>Battery calculation</summary>
+            <div class="battery-content" id="battery-content">
+              <p class="battery-intro">Off overnight. Off when idle. Wake it with the magnetic key for a handful of searches, then let it switch off again.</p>
+              <table class="battery-table">
+                <caption>Time connected drives the estimate.</caption>
+                <thead><tr><th scope="col">Wi-Fi available each day</th><th scope="col">Energy-only estimate</th></tr></thead>
+                <tbody>
+                  <tr><td>16 hours<span>Off overnight</span></td><td>4 to 9 months</td></tr>
+                  <tr><td>8 hours<span>Off when idle</span></td><td>8 to 19 months</td></tr>
+                  <tr><td>4 hours<span>Shorter daily sessions</span></td><td>15 to 38 months</td></tr>
+                </tbody>
+              </table>
+              <div class="battery-assumptions">
+                <h3>The assumptions</h3>
+                <p>Three 3,500 mAh cells at 3.6 V give 37.8 Wh nominal. Allowing 20% for conversion losses and reserve leaves about 30.2 Wh usable.</p>
+                <p>The examples assume a connected average of 2 to 5 mA at 3.3 V, including Wi-Fi Target Wake Time (TWT), and full power-off between reed-sensor wakes. TWT availability depends on the network role and router.</p>
+                <p class="battery-note">These are illustrative energy budgets, not measured board runtime. Storage activity, off-state leakage, cell condition, and self-discharge affect the result.</p>
+              </div>
+            </div>
+          </details>
+        </section>
+      </div>
+    </div>
+
+    <section class="access-section section-shell" id="access" aria-labelledby="access-title">
+      <div class="section-heading"><p class="eyebrow">How to use it</p><h2 id="access-title">Connect. Choose. Read.</h2><p>Browse while connected, or take a copy and leave the server off.</p></div>
+      <div class="field-scenes">
+        <figure class="field-photo wake-photo"><img src="assets/images/wake.webp" srcset="assets/images/wake.webp 1000w, assets/images/wake-1440.webp 1440w" sizes="(min-width:760px) 58vw, 90vw" width="1440" height="960" alt="A magnetic key held against the device to wake it." loading="lazy"><figcaption>Wake the library with a magnetic key.</figcaption></figure>
+        <figure class="field-photo chart-photo"><img src="assets/images/chart-800.webp" srcset="assets/images/chart-480.webp 480w, assets/images/chart-800.webp 800w" sizes="(min-width:760px) 35vw, 90vw" width="800" height="533" alt="The device beside a paper chart and compass on a boat’s chart table." loading="lazy"><figcaption>Keep a local reference wherever you’re working.</figcaption></figure>
+      </div>
+      <div class="access-patterns">
+        <article><span class="step-number">01</span><h3>Browse locally.</h3><p>Join the device’s Wi-Fi from a phone, tablet, or laptop. Open articles and manuals, or play media from the library.</p><p class="access-format">Browser → local Wi-Fi → library</p></article>
+        <article><span class="step-number">02</span><h3>Take a copy.</h3><p>Transfer compatible files to your own device. Once the copy is complete, you can keep reading with the server off.</p><details id="kindle-details" data-dialog-label="Reader compatibility"><summary>What about Kindle?</summary><p>Support depends on the Kindle model, file format, and transfer method. Direct Kindle transfer is still being worked out.</p></details></article>
+        <article><span class="step-number">03</span><h3>Refresh at home.</h3><p>Reconnect to update selected collections. Automatic updates are part of the firmware plan.</p><p class="access-format">Keep what you use. Refresh when connected.</p></article>
+      </div>
+    </section>
+
+    <section class="protocol-section section-shell" id="protocols" aria-labelledby="protocols-title">
+      <header class="section-heading"><p class="eyebrow">Formats / Sources / Connections</p><h2 id="protocols-title">Your library, on your terms.</h2><p>Keep the originals, retain their sources, and choose how to connect.</p></header>
+      <nav class="protocol-jumps" aria-label="Compatibility sections"><a href="#file-formats">File formats</a><a href="#sources">Sources</a><a href="#transmissions">Transmissions</a></nav>
+      <section class="protocol-block" id="file-formats" aria-labelledby="formats-title">
+        <header class="protocol-heading"><p class="eyebrow">01 / File formats</p><h3 id="formats-title">Bring the files<br>you already have.</h3><p>A full preparation catalogue, with original files kept alongside the searchable text.</p></header>
+        <div class="protocol-content">
+          <dl class="compatibility-list">
+            <div><dt>Books &amp; documents</dt><dd>PDF, EPUB, Word, OpenDocument, Pages, FictionBook, and WordPerfect</dd></div>
+            <div><dt>Research &amp; data</dt><dd>LaTeX, JATS, DocBook, BibTeX, RIS, JSON, CSV, SQLite, and GeoPackage</dd></div>
+            <div><dt>Images &amp; scans</dt><dd>JPEG, PNG, TIFF, SVG, HEIC, AVIF, JPEG 2000, and more</dd></div>
+            <div><dt>Media, email &amp; code</dt><dd>Audio transcripts, video audio tracks, mail archives, and 371 code/configuration grammars</dd></div>
+            <div><dt>Native payloads</dt><dd>Keep GPX, MBTiles, PMTiles, OSM PBF, STL, STEP, 3MF, GLB, and glTF files intact for compatible apps.</dd></div>
+          </dl>
+          <details id="format-details" data-dialog-label="Xberg preparation catalogue" data-dialog-title="Every format, in one place.">
+            <summary>Browse every file type</summary>
+            <div class="format-catalogue" id="format-catalogue">
+              <p class="catalogue-intro">The complete upstream Xberg registry, plus its code and configuration grammars. Extraction is prepared off-device; available extractors depend on the preparation build, including optional OCR, codecs, and transcription.</p>
+              <fieldset class="catalogue-controls" disabled hidden>
+                <legend class="visually-hidden">Filter the file catalogue</legend>
+                <label class="catalogue-search">Find a file type<input id="catalogue-query" type="search" placeholder="Name, extension, or MIME type" autocomplete="off" spellcheck="false"></label>
+                <div class="catalogue-field"><label for="catalogue-scope">Show</label><select id="catalogue-scope"><option value="all">All file types</option><option value="formats">File formats</option><option value="code">Code &amp; configuration</option></select></div>
+                <label class="catalogue-toggle"><input id="catalogue-mime" type="checkbox"> Show MIME types</label>
+              </fieldset>
+              <p class="catalogue-status" data-catalogue-status role="status">The full catalogue is available in the reference download below.</p>
+              <div data-catalogue-results></div>
+              <p class="catalogue-reference">Collection preparation also accepts Parquet and compressed NDJSON. Native map and fabrication payloads are carried unchanged, separately from Xberg extraction.</p>
+              <div class="catalogue-links"><a class="inline-link" href="assets/data/xberg-formats.json" download>Download the complete reference <span aria-hidden="true">↓</span></a><a class="inline-link" href="https://github.com/xberg-io/xberg/blob/246c33b12444014de04cdf39150db0597e8d168c/crates/xberg/src/core/mime.rs" target="_blank" rel="noopener noreferrer">Upstream registry <span aria-hidden="true">↗</span></a></div>
+            </div>
+          </details>
+        </div>
+      </section>
+      <section class="protocol-block" id="sources" aria-labelledby="sources-title">
+        <header class="protocol-heading"><p class="eyebrow">02 / Sources</p><h3 id="sources-title">Know where<br>it came from.</h3><p>Wikipedia preparation is in the host prototype. Maps, research, books, and personal archives make up the wider source plan.</p></header>
+        <dl class="compatibility-list source-list">
+          <div><dt><a href="https://www.wikipedia.org/" target="_blank" rel="noopener noreferrer">Wikipedia <span aria-hidden="true">↗</span></a><span class="support-state">Host prototype</span></dt><dd>Wikimedia reference articles, with source identity, revisions, citations, and attribution.</dd></div>
+          <div><dt><a href="https://www.openstreetmap.org/" target="_blank" rel="noopener noreferrer">OpenStreetMap <span aria-hidden="true">↗</span></a><span class="support-state">Planned</span></dt><dd>Selected regions, geographic data, and map attribution.</dd></div>
+          <div><dt><a href="https://pmc.ncbi.nlm.nih.gov/" target="_blank" rel="noopener noreferrer">PubMed Central <span aria-hidden="true">↗</span></a><span class="support-state">Planned</span></dt><dd>Open-access medical papers, retaining the licence, authors, citations, and publication dates.</dd></div>
+          <div><dt><a href="https://arxiv.org/" target="_blank" rel="noopener noreferrer">arXiv <span aria-hidden="true">↗</span></a><span class="support-state">Planned</span></dt><dd>Scientific and technical papers, including their versions and source records.</dd></div>
+          <div><dt><a href="https://www.gutenberg.org/" target="_blank" rel="noopener noreferrer">Project Gutenberg <span aria-hidden="true">↗</span></a><span class="support-state">Planned</span></dt><dd>Books and reference works selected with their territorial copyright terms.</dd></div>
+          <div><dt><a href="https://standardebooks.org/" target="_blank" rel="noopener noreferrer">Standard Ebooks <span aria-hidden="true">↗</span></a><span class="support-state">Planned</span></dt><dd>Carefully edited ebooks with their publication metadata and credits.</dd></div>
+          <div><dt>Your own files<span class="support-state">Native-file prototype</span></dt><dd>Manuals, datasheets, repair notes, field guides, and personal archives. Original bytes remain intact.</dd></div>
+        </dl>
+      </section>
+      <section class="protocol-block" id="transmissions" aria-labelledby="transmissions-title">
+        <header class="protocol-heading"><p class="eyebrow">03 / Transmissions</p><h3 id="transmissions-title">A connection<br>for the job.</h3><p>Browser access, reader catalogues, folder access, discovery, and radio control each have a different role.</p></header>
+        <div class="protocol-content">
+          <dl class="compatibility-list transmission-list">
+            <div><dt>Browse &amp; download<span class="support-state">Host prototype</span></dt><dd>HTTP/1.1 over TCP/IP. Native file responses, GET, HEAD, and conditional requests.</dd></div>
+            <div><dt>Reader catalogues<span class="support-state">Linux sample</span></dt><dd>OPDS 2.0 JSON acquisition feeds over HTTP.</dd></div>
+            <div><dt>Folder access<span class="support-state">Planned</span></dt><dd>Read-only WebDAV for compatible file managers and reading apps.</dd></div>
+            <div><dt>Resume &amp; seek<span class="support-state">Planned</span></dt><dd>HTTP byte-range requests for interrupted downloads and media seeking.</dd></div>
+            <div><dt>Collection refresh<span class="support-state">Host downloads; device refresh planned</span></dt><dd>HTTPS source downloads, recorded checksums, and conditional refreshes.</dd></div>
+            <div><dt>Find the library<span class="support-state">Planned</span></dt><dd>mDNS / DNS-SD on an existing network; DHCP and DNS for the device’s own Wi-Fi network.</dd></div>
+            <div><dt>Follow source updates<span class="support-state">Planned, off-device</span></dt><dd>RSS, Atom, and OAI-PMH where the source provides them.</dd></div>
+            <div><dt>Nearby controls<span class="support-state">Planned</span></dt><dd>Bluetooth LE GATT for setup and status while awake.</dd></div>
+            <div><dt>Small radio messages<span class="support-state">Exploring</span></dt><dd>LoRa / SX1262 for low-bandwidth packets. Application framing is still to be selected.</dd></div>
+            <div><dt>Carry a collection<span class="support-state">Device storage plan</span></dt><dd>microSD for physical loading, without a network connection.</dd></div>
+          </dl>
+          <details id="transport-details" data-dialog-label="Connections &amp; compatibility" data-dialog-title="The right protocol for each job.">
+            <summary>Protocol details</summary>
+            <div class="transport-notes">
+              <h3>Wi-Fi is the link. HTTP serves the files.</h3><p>The device can provide a local hotspot or join an existing network. The S31’s TWT requester support depends on a compatible access point and the chosen network role.</p>
+              <h3>Reader access</h3><p>OPDS is a catalogue and acquisition protocol. Version 2.0 uses JSON over HTTP. The Linux prototype serves a hardcoded OPDS 2.0 feed and EPUB for connection testing. Full collection catalogues and read-only WebDAV folder access are planned. Reader support varies by app and model.</p>
+              <h3>Downloads and media</h3><p>The host prototype serves native bytes over HTTP. Byte-range support is planned for resuming copies and seeking within media. Playback depends on the receiving app and its codecs.</p>
+              <h3>Discovery and refresh</h3><p>mDNS and DNS-SD help clients discover the library on a local network. DHCP and DNS serve a different purpose on its own hotspot. Collection preparation downloads over HTTP/HTTPS; automatic device refresh and source-feed harvesting are planned.</p>
+              <h3>Control and small payloads</h3><p>BLE GATT is intended for setup and status while the MCU is awake. The reed sensor provides the power-off wake path. LoRa is a low-bandwidth packet link; its application protocol remains a separate design choice.</p>
+              <h3>Offline loading</h3><p>A microSD card carries the prepared collection and original files. It is a physical transfer path, separate from network protocols.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </section>
+
+    <section class="system-section section-shell" id="system" aria-labelledby="system-title">
+      <div class="section-heading"><p class="eyebrow">The hardware</p><h2 id="system-title">Built to be understood.</h2><p>Designed to be fully weather-resistant, with a modular base for power and future extensions.</p></div>
+      <figure class="architecture-figure"><picture><source media="(max-width:599px)" srcset="assets/graphics/system-architecture-mobile.svg"><img src="assets/graphics/system-architecture.svg" width="1000" height="240" alt="The main board connects the local library, e-paper display, Wi-Fi, Bluetooth, and LoRa. Power comes from a separate base." loading="lazy"></picture><figcaption>System overview. The power base is a separate design.</figcaption></figure>
+      <div class="system-layout">
+        <div class="system-specs">
+          <dl><div><dt>Compute</dt><dd>ESP32-S31<span>Rust firmware</span></dd></div><div><dt>Library</dt><dd>microSD<span>Local reference collections, books, and media</span></dd></div><div><dt>Local access</dt><dd>Wi-Fi + Bluetooth<span>Wi-Fi serves the library; Bluetooth’s role is still to be defined.</span></dd></div><div><dt>External antenna</dt><dd>LoRa / SX1262<span>A separate low-bandwidth radio</span></dd></div><div><dt>Power</dt><dd>Modular three-cell base<span>Swap the base to extend power or add future modules.</span></dd></div></dl>
+          <details class="build-details" id="build-details" data-dialog-label="The hardware"><summary>Build details</summary><p>The main board and Rust firmware are in development. The charging board, enclosure fit, and final display panel are still to be selected or validated.</p><a class="inline-link" href="assets/models/omnipotent/omnipotent-1k.glb" download>Download the 3D concept <span aria-hidden="true">↓</span></a></details>
+        </div>
+        <div class="screen-study">
+          <div class="screen-frame"><epaper-display id="epaper" state="sleep"><img id="epaper-fallback" src="docs/assets/field-archive/screens/01-lights-out/screen.png" width="296" height="160" alt="Four-colour e-paper sleep screen."></epaper-display></div>
+          <p class="small-text">Try a display state</p>
+          <div class="screen-controls" role="group" aria-label="Preview e-paper state"><button type="button" data-screen="sleep" aria-pressed="true" disabled>Sleep</button><button type="button" data-screen="access" aria-pressed="false" disabled>Wi-Fi</button><button type="button" data-screen="index" aria-pressed="false" disabled>Indexing</button></div>
+          <p class="small-text">Black, paper-white, yellow, and red.<br>A screen that keeps its last image while asleep.</p>
+          <noscript><p class="small-text">Enable JavaScript to preview the other screen states.</p></noscript>
+        </div>
+      </div>
+    </section>
+    <section class="closing section-shell" aria-labelledby="closing-title"><p class="eyebrow">Open hardware. Offline knowledge.</p><h2 id="closing-title">Keep your library close.</h2><a class="button" href="#system">Explore the hardware <span aria-hidden="true">↑</span></a></section>
+  </main>
+  <footer class="site-footer"><a class="wordmark" href="#">omnipotent.</a><span>Knowledge, kept close.</span><a class="inline-link" href="assets.html">Assets <span aria-hidden="true">↗</span></a><a href="assets/models/omnipotent/omnipotent-1k.glb" download>Download the 3D concept <span aria-hidden="true">↓</span></a></footer>
+  <div class="modal" id="details-dialog" role="dialog" aria-modal="true" aria-labelledby="details-dialog-title" aria-hidden="true" tabindex="-1">
+    <div class="modal-backdrop" data-a11y-dialog-hide aria-hidden="true"></div>
+    <div class="modal-panel">
+      <header class="modal-header">
+        <div><p class="eyebrow">Details</p><h2 id="details-dialog-title">Details</h2></div>
+        <button class="modal-close" type="button" data-a11y-dialog-hide aria-label="Close dialog" autofocus><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </header>
+      <div class="modal-body" id="details-dialog-body" tabindex="0" role="region" aria-label="Dialog content"></div>
+    </div>
+  </div>
+</body>
+</html>

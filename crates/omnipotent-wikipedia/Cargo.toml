@@ -1,0 +1,21 @@
+[package]
+name = "omnipotent-wikipedia"
+version = "0.1.0"
+description = "Streaming Structured Wikipedia conversion to shared articles"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+omnipotent-format = { path = "../omnipotent-format" }
+parquet = { version = "58", default-features = false, features = ["arrow", "zstd"] }
+serde.workspace = true
+serde_arrow = { version = "0.15.1", features = ["arrow-58"] }
+serde_json = "1.0.154"
+url = "2.5"
+percent-encoding = "2.3"
+
+[dev-dependencies]
+arrow-schema = "58"
+tempfile = "3"

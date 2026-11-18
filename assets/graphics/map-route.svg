@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 200" fill="none">
+  <title>An illustrative street map with a saved route</title>
+  <path fill="#eae9df" d="M0 0h560v200H0z"/>
+  <path fill="#dce0d3" d="m0 0 125 0-24 65-55 31L0 88Zm375 126 185-34v108H352Z"/>
+  <path stroke="#ccd3cd" stroke-width="22" d="M375-20c-70 53-33 71-102 107s-55 69-85 124"/>
+  <g stroke="#f8f5ed" stroke-width="8"><path d="m-20 44 590 66M-10 155 580 33M83-20l66 240M198-20l-9 240M432-20l-61 240M512-20l20 240"/></g>
+  <g stroke="#b9b6aa" stroke-width="1"><path d="m-20 44 590 66M-10 155 580 33M83-20l66 240M198-20l-9 240M432-20l-61 240M512-20l20 240"/></g>
+  <path d="m111 97 26 94 243-48 24-95 85 10" stroke="#bf2922" stroke-width="3" stroke-linejoin="round"/>
+  <circle cx="111" cy="97" r="6" fill="#f7f5ef" stroke="#bf2922" stroke-width="3"/>
+  <circle cx="489" cy="58" r="6" fill="#bf2922"/>
+  <g fill="#292522" font-family="Arial,sans-serif" font-size="11"><text x="61" y="81">Start</text><text x="451" y="40">Saved route</text></g>
+  <path stroke="#77766c" d="M25 168v7h60v-7m-30 0v7"/>
+</svg>

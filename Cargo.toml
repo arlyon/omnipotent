@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/omnipotent-format", "crates/omnipotent-storage-tests", "crates/omnipotent-wikipedia", "crates/omnipotent-embed", "crates/omnipotent-pack", "crates/omnipotent-serve", "crates/omnipotent-linux"]
+exclude = ["vendor/shodh-redb", "vendor/candle-core", "vendor/candle-kernels", "firmware/esp32c6"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
+zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }

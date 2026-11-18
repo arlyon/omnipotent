@@ -1,0 +1,3725 @@
+{
+  "schema": 1,
+  "provenance": {
+    "project": "Xberg",
+    "commit": "246c33b12444014de04cdf39150db0597e8d168c",
+    "registry_url": "https://github.com/xberg-io/xberg/blob/246c33b12444014de04cdf39150db0597e8d168c/crates/xberg/src/core/mime.rs",
+    "registry_sha256": "21a8e7d6053468bbe343be05338acee860b36c9a1df16a138a7bc0b46beec7b7",
+    "language_pack_version": "1.25.2",
+    "language_registry_url": "https://github.com/xberg-io/tree-sitter-language-pack/blob/v1.25.2/crates/ts-pack-core/language_definitions.json",
+    "language_registry_sha256": "0712fdaeaf7594548f1cad60db7af5f661b6171ea353814e10d610b5a22c6c66",
+    "note": "Full upstream registry, not an enabled-extractor inventory for a particular build. OCR, transcription, native codecs and tree-sitter support depend on preparation features. Video extraction transcribes audio, not video frames."
+  },
+  "formats": [
+    {
+      "extensions": [
+        "txt"
+      ],
+      "mime": "text/plain",
+      "aliases": [],
+      "name": "Plain text",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "adoc",
+        "asciidoc"
+      ],
+      "mime": "text/asciidoc",
+      "aliases": [
+        "text/x-asciidoc"
+      ],
+      "name": "AsciiDoc",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "vtt"
+      ],
+      "mime": "text/vtt",
+      "aliases": [],
+      "name": "WebVTT captions",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "md",
+        "markdown"
+      ],
+      "mime": "text/markdown",
+      "aliases": [
+        "text/x-markdown"
+      ],
+      "name": "Markdown",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "commonmark"
+      ],
+      "mime": "text/x-commonmark",
+      "aliases": [],
+      "name": "CommonMark",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [],
+      "mime": "text/x-gfm",
+      "aliases": [],
+      "name": "GitHub Flavored Markdown",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [],
+      "mime": "text/x-markdown-extra",
+      "aliases": [],
+      "name": "Markdown Extra",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [],
+      "mime": "text/x-multimarkdown",
+      "aliases": [],
+      "name": "MultiMarkdown",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [],
+      "mime": "text/x-pandoc",
+      "aliases": [],
+      "name": "Pandoc Markdown",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "qmd"
+      ],
+      "mime": "text/x-quarto",
+      "aliases": [
+        "application/x-quarto"
+      ],
+      "name": "Quarto",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "rmd"
+      ],
+      "mime": "text/x-r-markdown",
+      "aliases": [],
+      "name": "R Markdown",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "mdx"
+      ],
+      "mime": "text/mdx",
+      "aliases": [
+        "text/x-mdx"
+      ],
+      "name": "MDX",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "djot",
+        "dj"
+      ],
+      "mime": "text/x-djot",
+      "aliases": [
+        "text/djot"
+      ],
+      "name": "Djot",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "doctags"
+      ],
+      "mime": "text/vnd.docling.doctags",
+      "aliases": [
+        "application/vnd.docling.doctags"
+      ],
+      "name": "Docling DocTags",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "pdf"
+      ],
+      "mime": "application/pdf",
+      "aliases": [],
+      "name": "PDF",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "html",
+        "htm"
+      ],
+      "mime": "text/html",
+      "aliases": [],
+      "name": "HTML",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "xhtml",
+        "xht"
+      ],
+      "mime": "application/xhtml+xml",
+      "aliases": [],
+      "name": "XHTML",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "docx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "aliases": [
+        "application/docx"
+      ],
+      "name": "Word document",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "docm"
+      ],
+      "mime": "application/vnd.ms-word.document.macroEnabled.12",
+      "aliases": [],
+      "name": "Word macro-enabled document",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "dotx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+      "aliases": [],
+      "name": "Word template",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "dotm"
+      ],
+      "mime": "application/vnd.ms-word.template.macroEnabled.12",
+      "aliases": [],
+      "name": "Word macro-enabled template",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "doc",
+        "dot"
+      ],
+      "mime": "application/msword",
+      "aliases": [],
+      "name": "Legacy Word",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "odt"
+      ],
+      "mime": "application/vnd.oasis.opendocument.text",
+      "aliases": [],
+      "name": "OpenDocument Text",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "odp"
+      ],
+      "mime": "application/vnd.oasis.opendocument.presentation",
+      "aliases": [],
+      "name": "OpenDocument Presentation",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "pptx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "aliases": [],
+      "name": "PowerPoint",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "ppsx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+      "aliases": [],
+      "name": "PowerPoint slideshow",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "pptm"
+      ],
+      "mime": "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+      "aliases": [],
+      "name": "PowerPoint macro-enabled presentation",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "potx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.presentationml.template",
+      "aliases": [],
+      "name": "PowerPoint template",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "potm"
+      ],
+      "mime": "application/vnd.ms-powerpoint.template.macroEnabled.12",
+      "aliases": [],
+      "name": "PowerPoint macro-enabled template",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "ppt",
+        "pot",
+        "pps"
+      ],
+      "mime": "application/vnd.ms-powerpoint",
+      "aliases": [],
+      "name": "Legacy PowerPoint",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "xlsx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "aliases": [],
+      "name": "Excel workbook",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "xltx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+      "aliases": [],
+      "name": "Excel template",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "xls",
+        "xlt",
+        "xla"
+      ],
+      "mime": "application/vnd.ms-excel",
+      "aliases": [],
+      "name": "Legacy Excel",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "xlsm"
+      ],
+      "mime": "application/vnd.ms-excel.sheet.macroEnabled.12",
+      "aliases": [],
+      "name": "Excel macro-enabled workbook",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "xlsb"
+      ],
+      "mime": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+      "aliases": [],
+      "name": "Excel binary workbook",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "xlam"
+      ],
+      "mime": "application/vnd.ms-excel.addin.macroEnabled.12",
+      "aliases": [
+        "application/vnd.ms-excel.addin.macroEnabled"
+      ],
+      "name": "Excel add-in",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "xltm"
+      ],
+      "mime": "application/vnd.ms-excel.template.macroEnabled.12",
+      "aliases": [],
+      "name": "Excel macro-enabled template",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "ods"
+      ],
+      "mime": "application/vnd.oasis.opendocument.spreadsheet",
+      "aliases": [],
+      "name": "OpenDocument Spreadsheet",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "fodg"
+      ],
+      "mime": "application/vnd.oasis.opendocument.graphics-flat-xml",
+      "aliases": [],
+      "name": "Flat OpenDocument Graphics",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "dbf"
+      ],
+      "mime": "application/vnd.dbf",
+      "aliases": [
+        "application/x-dbf",
+        "application/dbase"
+      ],
+      "name": "dBASE",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "sqlite",
+        "sqlite3",
+        "db"
+      ],
+      "mime": "application/vnd.sqlite3",
+      "aliases": [
+        "application/x-sqlite3"
+      ],
+      "name": "SQLite",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "gpkg",
+        "gpkx"
+      ],
+      "mime": "application/geopackage+sqlite3",
+      "aliases": [],
+      "name": "GeoPackage",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "hwp"
+      ],
+      "mime": "application/x-hwp",
+      "aliases": [],
+      "name": "Hangul Word Processor",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "hwpx"
+      ],
+      "mime": "application/haansofthwpx",
+      "aliases": [
+        "application/hwp+zip"
+      ],
+      "name": "Hangul XML",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "wpd",
+        "wp",
+        "wp5",
+        "wp6"
+      ],
+      "mime": "application/vnd.wordperfect",
+      "aliases": [
+        "application/wordperfect"
+      ],
+      "name": "WordPerfect",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "bmp"
+      ],
+      "mime": "image/bmp",
+      "aliases": [
+        "image/x-bmp",
+        "image/x-ms-bmp"
+      ],
+      "name": "BMP",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "gif"
+      ],
+      "mime": "image/gif",
+      "aliases": [],
+      "name": "GIF",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "jpg",
+        "jpeg"
+      ],
+      "mime": "image/jpeg",
+      "aliases": [
+        "image/pjpeg",
+        "image/jpg"
+      ],
+      "name": "JPEG",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "png"
+      ],
+      "mime": "image/png",
+      "aliases": [],
+      "name": "PNG",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "tiff",
+        "tif"
+      ],
+      "mime": "image/tiff",
+      "aliases": [
+        "image/x-tiff"
+      ],
+      "name": "TIFF",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "webp"
+      ],
+      "mime": "image/webp",
+      "aliases": [],
+      "name": "WEBP",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "jp2",
+        "jpg2"
+      ],
+      "mime": "image/jp2",
+      "aliases": [],
+      "name": "JPEG 2000 container",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "j2c",
+        "j2k",
+        "jpc"
+      ],
+      "mime": "image/j2c",
+      "aliases": [],
+      "name": "JPEG 2000 codestream",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "jbig2",
+        "jb2"
+      ],
+      "mime": "image/x-jbig2",
+      "aliases": [],
+      "name": "JBIG2",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "heic"
+      ],
+      "mime": "image/heic",
+      "aliases": [],
+      "name": "HEIC",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "heics"
+      ],
+      "mime": "image/heic-sequence",
+      "aliases": [],
+      "name": "HEIC image sequence",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "heif",
+        "hif"
+      ],
+      "mime": "image/heif",
+      "aliases": [],
+      "name": "HEIF",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "heifs"
+      ],
+      "mime": "image/heif-sequence",
+      "aliases": [],
+      "name": "HEIF image sequence",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "avif"
+      ],
+      "mime": "image/avif",
+      "aliases": [],
+      "name": "AVIF",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "avcs"
+      ],
+      "mime": "image/avcs",
+      "aliases": [],
+      "name": "AVCS",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "pnm"
+      ],
+      "mime": "image/x-portable-anymap",
+      "aliases": [],
+      "name": "NetPBM anymap",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "pbm"
+      ],
+      "mime": "image/x-portable-bitmap",
+      "aliases": [],
+      "name": "NetPBM bitmap",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "pgm"
+      ],
+      "mime": "image/x-portable-graymap",
+      "aliases": [],
+      "name": "NetPBM graymap",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "ppm"
+      ],
+      "mime": "image/x-portable-pixmap",
+      "aliases": [],
+      "name": "NetPBM pixmap",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "csv"
+      ],
+      "mime": "text/csv",
+      "aliases": [],
+      "name": "CSV",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "tsv"
+      ],
+      "mime": "text/tab-separated-values",
+      "aliases": [],
+      "name": "TSV",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "json"
+      ],
+      "mime": "application/json",
+      "aliases": [
+        "text/json"
+      ],
+      "name": "JSON",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "geojson"
+      ],
+      "mime": "application/geo+json",
+      "aliases": [
+        "application/vnd.geo+json"
+      ],
+      "name": "GeoJSON",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [],
+      "mime": "application/csl+json",
+      "aliases": [],
+      "name": "CSL JSON citations",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "jsonl",
+        "ndjson"
+      ],
+      "mime": "application/x-ndjson",
+      "aliases": [
+        "application/jsonl",
+        "application/x-jsonlines"
+      ],
+      "name": "JSON Lines / NDJSON",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "yaml",
+        "yml"
+      ],
+      "mime": "application/yaml",
+      "aliases": [
+        "application/x-yaml",
+        "text/yaml",
+        "text/x-yaml"
+      ],
+      "name": "YAML",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "toml"
+      ],
+      "mime": "application/toml",
+      "aliases": [
+        "text/toml"
+      ],
+      "name": "TOML",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "xml"
+      ],
+      "mime": "application/xml",
+      "aliases": [
+        "text/xml"
+      ],
+      "name": "XML",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "kml"
+      ],
+      "mime": "application/vnd.google-earth.kml+xml",
+      "aliases": [],
+      "name": "KML",
+      "group": "Data & geography"
+    },
+    {
+      "extensions": [
+        "svg"
+      ],
+      "mime": "image/svg+xml",
+      "aliases": [],
+      "name": "SVG",
+      "group": "Images & scans"
+    },
+    {
+      "extensions": [
+        "eml"
+      ],
+      "mime": "message/rfc822",
+      "aliases": [],
+      "name": "Email message",
+      "group": "Email"
+    },
+    {
+      "extensions": [
+        "msg"
+      ],
+      "mime": "application/vnd.ms-outlook",
+      "aliases": [],
+      "name": "Outlook message",
+      "group": "Email"
+    },
+    {
+      "extensions": [
+        "pst"
+      ],
+      "mime": "application/vnd.ms-outlook-pst",
+      "aliases": [],
+      "name": "Outlook store",
+      "group": "Email"
+    },
+    {
+      "extensions": [
+        "zip"
+      ],
+      "mime": "application/zip",
+      "aliases": [
+        "application/x-zip-compressed"
+      ],
+      "name": "ZIP",
+      "group": "Archives"
+    },
+    {
+      "extensions": [
+        "tar"
+      ],
+      "mime": "application/x-tar",
+      "aliases": [
+        "application/tar",
+        "application/x-gtar",
+        "application/x-ustar"
+      ],
+      "name": "TAR",
+      "group": "Archives"
+    },
+    {
+      "extensions": [
+        "gz",
+        "tgz"
+      ],
+      "mime": "application/gzip",
+      "aliases": [
+        "application/x-gzip"
+      ],
+      "name": "Gzip",
+      "group": "Archives"
+    },
+    {
+      "extensions": [
+        "7z"
+      ],
+      "mime": "application/x-7z-compressed",
+      "aliases": [],
+      "name": "7-Zip",
+      "group": "Archives"
+    },
+    {
+      "extensions": [
+        "rst"
+      ],
+      "mime": "text/prs.fallenstein.rst",
+      "aliases": [
+        "text/x-rst"
+      ],
+      "name": "reStructuredText",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "org"
+      ],
+      "mime": "text/org",
+      "aliases": [
+        "text/x-org",
+        "application/x-org"
+      ],
+      "name": "Org Mode",
+      "group": "Text & markup"
+    },
+    {
+      "extensions": [
+        "epub"
+      ],
+      "mime": "application/epub+zip",
+      "aliases": [
+        "application/x-epub+zip",
+        "application/vnd.epub+zip"
+      ],
+      "name": "EPUB",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "rtf"
+      ],
+      "mime": "application/rtf",
+      "aliases": [
+        "text/rtf"
+      ],
+      "name": "RTF",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "bib"
+      ],
+      "mime": "application/x-bibtex",
+      "aliases": [
+        "text/x-bibtex",
+        "application/x-biblatex"
+      ],
+      "name": "BibTeX / BibLaTeX",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "ris"
+      ],
+      "mime": "application/x-research-info-systems",
+      "aliases": [],
+      "name": "RIS citations",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "nbib"
+      ],
+      "mime": "application/x-pubmed",
+      "aliases": [],
+      "name": "PubMed / MEDLINE",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "enw"
+      ],
+      "mime": "application/x-endnote+xml",
+      "aliases": [],
+      "name": "EndNote XML",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "fb2"
+      ],
+      "mime": "application/x-fictionbook+xml",
+      "aliases": [
+        "application/x-fictionbook",
+        "text/x-fictionbook"
+      ],
+      "name": "FictionBook",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "opml"
+      ],
+      "mime": "application/xml+opml",
+      "aliases": [
+        "application/x-opml+xml",
+        "text/x-opml"
+      ],
+      "name": "OPML outlines",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "dbk",
+        "docbook",
+        "docbook4",
+        "docbook5"
+      ],
+      "mime": "application/docbook+xml",
+      "aliases": [
+        "text/docbook"
+      ],
+      "name": "DocBook",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "jats",
+        "nxml"
+      ],
+      "mime": "application/x-jats+xml",
+      "aliases": [
+        "text/jats"
+      ],
+      "name": "JATS journal articles",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "ipynb"
+      ],
+      "mime": "application/x-ipynb+json",
+      "aliases": [],
+      "name": "Jupyter Notebook",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "tex",
+        "latex"
+      ],
+      "mime": "application/x-latex",
+      "aliases": [
+        "text/x-tex",
+        "application/x-tex"
+      ],
+      "name": "LaTeX",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "typst",
+        "typ"
+      ],
+      "mime": "text/vnd.typst",
+      "aliases": [
+        "text/x-typst",
+        "application/x-typst"
+      ],
+      "name": "Typst",
+      "group": "Books & research"
+    },
+    {
+      "extensions": [
+        "pages"
+      ],
+      "mime": "application/x-iwork-pages-sffpages",
+      "aliases": [
+        "application/vnd.apple.pages"
+      ],
+      "name": "Apple Pages",
+      "group": "Documents"
+    },
+    {
+      "extensions": [
+        "numbers"
+      ],
+      "mime": "application/x-iwork-numbers-sffnumbers",
+      "aliases": [
+        "application/vnd.apple.numbers"
+      ],
+      "name": "Apple Numbers",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "key"
+      ],
+      "mime": "application/x-iwork-keynote-sffkey",
+      "aliases": [
+        "application/vnd.apple.keynote"
+      ],
+      "name": "Apple Keynote",
+      "group": "Spreadsheets & slides"
+    },
+    {
+      "extensions": [
+        "mp3",
+        "mpga"
+      ],
+      "mime": "audio/mpeg",
+      "aliases": [
+        "audio/mp3"
+      ],
+      "name": "MP3",
+      "group": "Audio & video"
+    },
+    {
+      "extensions": [
+        "m4a"
+      ],
+      "mime": "audio/mp4",
+      "aliases": [
+        "audio/x-m4a"
+      ],
+      "name": "M4A / AAC",
+      "group": "Audio & video"
+    },
+    {
+      "extensions": [
+        "wav"
+      ],
+      "mime": "audio/wav",
+      "aliases": [
+        "audio/x-wav"
+      ],
+      "name": "WAV",
+      "group": "Audio & video"
+    },
+    {
+      "extensions": [
+        "webm"
+      ],
+      "mime": "audio/webm",
+      "aliases": [
+        "video/webm"
+      ],
+      "name": "WebM audio / video",
+      "group": "Audio & video"
+    },
+    {
+      "extensions": [
+        "mp4",
+        "mpg4",
+        "mp4v",
+        "m4v"
+      ],
+      "mime": "video/mp4",
+      "aliases": [],
+      "name": "MP4 video audio track",
+      "group": "Audio & video"
+    },
+    {
+      "extensions": [
+        "mpeg",
+        "mpg",
+        "mpe",
+        "m1v",
+        "m2v"
+      ],
+      "mime": "video/mpeg",
+      "aliases": [],
+      "name": "MPEG video audio track",
+      "group": "Audio & video"
+    },
+    {
+      "extensions": [],
+      "mime": "text/x-source-code",
+      "aliases": [
+        "application/x-sh",
+        "text/x-sh",
+        "text/x-shellscript",
+        "text/x-python",
+        "text/x-r-source",
+        "text/x-julia",
+        "text/vnd.graphviz",
+        "text/x-plantuml"
+      ],
+      "name": "Source code",
+      "group": "Code & configuration"
+    }
+  ],
+  "languages": [
+    {
+      "id": "abl",
+      "name": "Abl",
+      "extensions": [
+        "p",
+        "cls",
+        "w"
+      ]
+    },
+    {
+      "id": "abnf",
+      "name": "Abnf",
+      "extensions": [
+        "abnf"
+      ]
+    },
+    {
+      "id": "actionscript",
+      "name": "Actionscript",
+      "extensions": [
+        "as"
+      ]
+    },
+    {
+      "id": "ada",
+      "name": "Ada",
+      "extensions": [
+        "ada",
+        "adb",
+        "ads"
+      ]
+    },
+    {
+      "id": "agda",
+      "name": "Agda",
+      "extensions": [
+        "agda"
+      ]
+    },
+    {
+      "id": "aiken",
+      "name": "Aiken",
+      "extensions": [
+        "ak"
+      ]
+    },
+    {
+      "id": "al",
+      "name": "Al",
+      "extensions": [
+        "al"
+      ]
+    },
+    {
+      "id": "angular",
+      "name": "Angular",
+      "extensions": []
+    },
+    {
+      "id": "apex",
+      "name": "Apex",
+      "extensions": [
+        "trigger"
+      ]
+    },
+    {
+      "id": "applescript",
+      "name": "Applescript",
+      "extensions": [
+        "applescript",
+        "scpt"
+      ]
+    },
+    {
+      "id": "arduino",
+      "name": "Arduino",
+      "extensions": [
+        "ino"
+      ]
+    },
+    {
+      "id": "asciidoc",
+      "name": "Asciidoc",
+      "extensions": [
+        "adoc",
+        "asciidoc"
+      ]
+    },
+    {
+      "id": "asm",
+      "name": "Asm",
+      "extensions": [
+        "s",
+        "asm"
+      ]
+    },
+    {
+      "id": "astro",
+      "name": "Astro",
+      "extensions": [
+        "astro"
+      ]
+    },
+    {
+      "id": "avro",
+      "name": "Avro",
+      "extensions": [
+        "avdl"
+      ]
+    },
+    {
+      "id": "awk",
+      "name": "Awk",
+      "extensions": [
+        "awk"
+      ]
+    },
+    {
+      "id": "ballerina",
+      "name": "Ballerina",
+      "extensions": [
+        "bal"
+      ]
+    },
+    {
+      "id": "baml",
+      "name": "Baml",
+      "extensions": [
+        "baml"
+      ]
+    },
+    {
+      "id": "bash",
+      "name": "Bash",
+      "extensions": [
+        "sh",
+        "bash"
+      ]
+    },
+    {
+      "id": "bass",
+      "name": "Bass",
+      "extensions": []
+    },
+    {
+      "id": "batch",
+      "name": "Batch",
+      "extensions": [
+        "bat",
+        "cmd"
+      ]
+    },
+    {
+      "id": "beancount",
+      "name": "Beancount",
+      "extensions": [
+        "beancount"
+      ]
+    },
+    {
+      "id": "bibtex",
+      "name": "Bibtex",
+      "extensions": [
+        "bib"
+      ]
+    },
+    {
+      "id": "bicep",
+      "name": "Bicep",
+      "extensions": [
+        "bicep"
+      ]
+    },
+    {
+      "id": "bitbake",
+      "name": "Bitbake",
+      "extensions": [
+        "bb",
+        "bbappend",
+        "bbclass"
+      ]
+    },
+    {
+      "id": "blade",
+      "name": "Blade",
+      "extensions": [
+        "blade"
+      ]
+    },
+    {
+      "id": "bpftrace",
+      "name": "Bpftrace",
+      "extensions": [
+        "bt"
+      ]
+    },
+    {
+      "id": "brightscript",
+      "name": "Brightscript",
+      "extensions": [
+        "brs"
+      ]
+    },
+    {
+      "id": "bsl",
+      "name": "Bsl",
+      "extensions": [
+        "bsl"
+      ]
+    },
+    {
+      "id": "c",
+      "name": "C",
+      "extensions": [
+        "c",
+        "h"
+      ]
+    },
+    {
+      "id": "c3",
+      "name": "C3",
+      "extensions": [
+        "c3",
+        "c3i",
+        "c3t"
+      ]
+    },
+    {
+      "id": "caddy",
+      "name": "Caddy",
+      "extensions": [
+        "caddyfile"
+      ]
+    },
+    {
+      "id": "cairo",
+      "name": "Cairo",
+      "extensions": [
+        "cairo"
+      ]
+    },
+    {
+      "id": "capnp",
+      "name": "Capnp",
+      "extensions": [
+        "capnp"
+      ]
+    },
+    {
+      "id": "cedar",
+      "name": "Cedar",
+      "extensions": [
+        "cedar"
+      ]
+    },
+    {
+      "id": "cedarschema",
+      "name": "Cedarschema",
+      "extensions": [
+        "cedarschema"
+      ]
+    },
+    {
+      "id": "cel",
+      "name": "Cel",
+      "extensions": [
+        "cel"
+      ]
+    },
+    {
+      "id": "cfml",
+      "name": "Cfml",
+      "extensions": [
+        "cfc"
+      ]
+    },
+    {
+      "id": "chatito",
+      "name": "Chatito",
+      "extensions": [
+        "chatito"
+      ]
+    },
+    {
+      "id": "chuck",
+      "name": "Chuck",
+      "extensions": [
+        "ck"
+      ]
+    },
+    {
+      "id": "circom",
+      "name": "Circom",
+      "extensions": [
+        "circom"
+      ]
+    },
+    {
+      "id": "clarity",
+      "name": "Clarity",
+      "extensions": [
+        "clar"
+      ]
+    },
+    {
+      "id": "clojure",
+      "name": "Clojure",
+      "extensions": [
+        "clj",
+        "cljs",
+        "cljc"
+      ]
+    },
+    {
+      "id": "cmake",
+      "name": "CMake",
+      "extensions": [
+        "cmake"
+      ]
+    },
+    {
+      "id": "cobol",
+      "name": "Cobol",
+      "extensions": [
+        "cobol",
+        "cob",
+        "cbl"
+      ]
+    },
+    {
+      "id": "comment",
+      "name": "Comment",
+      "extensions": []
+    },
+    {
+      "id": "commonlisp",
+      "name": "Commonlisp",
+      "extensions": [
+        "lisp",
+        "cl"
+      ]
+    },
+    {
+      "id": "cooklang",
+      "name": "Cooklang",
+      "extensions": [
+        "cook"
+      ]
+    },
+    {
+      "id": "corn",
+      "name": "Corn",
+      "extensions": [
+        "corn"
+      ]
+    },
+    {
+      "id": "cpon",
+      "name": "Cpon",
+      "extensions": [
+        "cpon"
+      ]
+    },
+    {
+      "id": "cpp",
+      "name": "C++",
+      "extensions": [
+        "cpp",
+        "cxx",
+        "cc",
+        "hpp",
+        "hxx"
+      ]
+    },
+    {
+      "id": "crystal",
+      "name": "Crystal",
+      "extensions": [
+        "cr"
+      ]
+    },
+    {
+      "id": "csharp",
+      "name": "C#",
+      "extensions": [
+        "cs"
+      ]
+    },
+    {
+      "id": "css",
+      "name": "CSS",
+      "extensions": [
+        "css"
+      ]
+    },
+    {
+      "id": "cst",
+      "name": "Cst",
+      "extensions": [
+        "cst"
+      ]
+    },
+    {
+      "id": "csv",
+      "name": "Csv",
+      "extensions": [
+        "csv"
+      ]
+    },
+    {
+      "id": "cuda",
+      "name": "CUDA",
+      "extensions": [
+        "cu",
+        "cuda"
+      ]
+    },
+    {
+      "id": "cue",
+      "name": "Cue",
+      "extensions": [
+        "cue"
+      ]
+    },
+    {
+      "id": "cypher",
+      "name": "Cypher",
+      "extensions": [
+        "cypher",
+        "cql"
+      ]
+    },
+    {
+      "id": "cython",
+      "name": "Cython",
+      "extensions": [
+        "pyx",
+        "pxd",
+        "pxi"
+      ]
+    },
+    {
+      "id": "d",
+      "name": "D",
+      "extensions": [
+        "d"
+      ]
+    },
+    {
+      "id": "d2",
+      "name": "D2",
+      "extensions": [
+        "d2"
+      ]
+    },
+    {
+      "id": "dart",
+      "name": "Dart",
+      "extensions": [
+        "dart"
+      ]
+    },
+    {
+      "id": "desktop",
+      "name": "Desktop",
+      "extensions": [
+        "desktop"
+      ]
+    },
+    {
+      "id": "devicetree",
+      "name": "Devicetree",
+      "extensions": [
+        "dts",
+        "dtsi"
+      ]
+    },
+    {
+      "id": "dhall",
+      "name": "Dhall",
+      "extensions": [
+        "dhall"
+      ]
+    },
+    {
+      "id": "diff",
+      "name": "Diff",
+      "extensions": [
+        "diff",
+        "patch"
+      ]
+    },
+    {
+      "id": "djot",
+      "name": "Djot",
+      "extensions": [
+        "dj"
+      ]
+    },
+    {
+      "id": "dockerfile",
+      "name": "Dockerfile",
+      "extensions": [
+        "dockerfile"
+      ]
+    },
+    {
+      "id": "dot",
+      "name": "Dot",
+      "extensions": [
+        "dot",
+        "gv"
+      ]
+    },
+    {
+      "id": "dotenv",
+      "name": "Dotenv",
+      "extensions": []
+    },
+    {
+      "id": "doxygen",
+      "name": "Doxygen",
+      "extensions": []
+    },
+    {
+      "id": "dtd",
+      "name": "Dtd",
+      "extensions": [
+        "dtd"
+      ]
+    },
+    {
+      "id": "earthfile",
+      "name": "Earthfile",
+      "extensions": []
+    },
+    {
+      "id": "ebnf",
+      "name": "Ebnf",
+      "extensions": [
+        "ebnf"
+      ]
+    },
+    {
+      "id": "editorconfig",
+      "name": "Editorconfig",
+      "extensions": []
+    },
+    {
+      "id": "edoc",
+      "name": "Edoc",
+      "extensions": [
+        "edoc"
+      ]
+    },
+    {
+      "id": "eds",
+      "name": "Eds",
+      "extensions": [
+        "eds"
+      ]
+    },
+    {
+      "id": "eex",
+      "name": "Eex",
+      "extensions": [
+        "eex",
+        "leex"
+      ]
+    },
+    {
+      "id": "eiffel",
+      "name": "Eiffel",
+      "extensions": [
+        "e"
+      ]
+    },
+    {
+      "id": "elisp",
+      "name": "Elisp",
+      "extensions": [
+        "el"
+      ]
+    },
+    {
+      "id": "elixir",
+      "name": "Elixir",
+      "extensions": [
+        "ex",
+        "exs"
+      ]
+    },
+    {
+      "id": "elm",
+      "name": "Elm",
+      "extensions": [
+        "elm"
+      ]
+    },
+    {
+      "id": "elsa",
+      "name": "Elsa",
+      "extensions": [
+        "lc"
+      ]
+    },
+    {
+      "id": "elvish",
+      "name": "Elvish",
+      "extensions": [
+        "elv"
+      ]
+    },
+    {
+      "id": "embeddedtemplate",
+      "name": "Embeddedtemplate",
+      "extensions": [
+        "erb"
+      ]
+    },
+    {
+      "id": "enforce",
+      "name": "Enforce",
+      "extensions": [
+        "enforce"
+      ]
+    },
+    {
+      "id": "erlang",
+      "name": "Erlang",
+      "extensions": [
+        "erl",
+        "hrl"
+      ]
+    },
+    {
+      "id": "facility",
+      "name": "Facility",
+      "extensions": [
+        "fsd"
+      ]
+    },
+    {
+      "id": "faust",
+      "name": "Faust",
+      "extensions": [
+        "dsp"
+      ]
+    },
+    {
+      "id": "fennel",
+      "name": "Fennel",
+      "extensions": [
+        "fnl"
+      ]
+    },
+    {
+      "id": "fidl",
+      "name": "Fidl",
+      "extensions": [
+        "fidl"
+      ]
+    },
+    {
+      "id": "firrtl",
+      "name": "Firrtl",
+      "extensions": [
+        "fir"
+      ]
+    },
+    {
+      "id": "fish",
+      "name": "Fish",
+      "extensions": [
+        "fish"
+      ]
+    },
+    {
+      "id": "flatbuffers",
+      "name": "Flatbuffers",
+      "extensions": [
+        "fbs"
+      ]
+    },
+    {
+      "id": "fluent",
+      "name": "Fluent",
+      "extensions": [
+        "ftl"
+      ]
+    },
+    {
+      "id": "foam",
+      "name": "Foam",
+      "extensions": []
+    },
+    {
+      "id": "forth",
+      "name": "Forth",
+      "extensions": [
+        "fth",
+        "4th"
+      ]
+    },
+    {
+      "id": "fortran",
+      "name": "Fortran",
+      "extensions": [
+        "f90",
+        "f95",
+        "f03",
+        "f08",
+        "f"
+      ]
+    },
+    {
+      "id": "fsharp",
+      "name": "F#",
+      "extensions": [
+        "fs",
+        "fsx"
+      ]
+    },
+    {
+      "id": "fsharp_signature",
+      "name": "Fsharp Signature",
+      "extensions": [
+        "fsi"
+      ]
+    },
+    {
+      "id": "func",
+      "name": "Func",
+      "extensions": [
+        "fc"
+      ]
+    },
+    {
+      "id": "fusion",
+      "name": "Fusion",
+      "extensions": [
+        "fusion"
+      ]
+    },
+    {
+      "id": "gap",
+      "name": "Gap",
+      "extensions": [
+        "g",
+        "gi"
+      ]
+    },
+    {
+      "id": "gcode",
+      "name": "Gcode",
+      "extensions": [
+        "gcode",
+        "gco",
+        "ngc",
+        "nc",
+        "tap",
+        "cnc"
+      ]
+    },
+    {
+      "id": "gdscript",
+      "name": "Gdscript",
+      "extensions": [
+        "gd"
+      ]
+    },
+    {
+      "id": "gdshader",
+      "name": "Gdshader",
+      "extensions": [
+        "gdshader"
+      ]
+    },
+    {
+      "id": "gherkin",
+      "name": "Gherkin",
+      "extensions": [
+        "feature"
+      ]
+    },
+    {
+      "id": "git_config",
+      "name": "Git Config",
+      "extensions": []
+    },
+    {
+      "id": "git_rebase",
+      "name": "Git Rebase",
+      "extensions": []
+    },
+    {
+      "id": "gitattributes",
+      "name": "Gitattributes",
+      "extensions": [
+        "gitattributes"
+      ]
+    },
+    {
+      "id": "gitcommit",
+      "name": "Gitcommit",
+      "extensions": []
+    },
+    {
+      "id": "gitignore",
+      "name": "Gitignore",
+      "extensions": [
+        "gitignore"
+      ]
+    },
+    {
+      "id": "gleam",
+      "name": "Gleam",
+      "extensions": [
+        "gleam"
+      ]
+    },
+    {
+      "id": "glimmer",
+      "name": "Glimmer",
+      "extensions": [
+        "hbs"
+      ]
+    },
+    {
+      "id": "glsl",
+      "name": "GLSL",
+      "extensions": [
+        "glsl"
+      ]
+    },
+    {
+      "id": "gn",
+      "name": "Gn",
+      "extensions": [
+        "gn",
+        "gni"
+      ]
+    },
+    {
+      "id": "gnuplot",
+      "name": "Gnuplot",
+      "extensions": [
+        "gp",
+        "gnuplot",
+        "plt"
+      ]
+    },
+    {
+      "id": "go",
+      "name": "Go",
+      "extensions": [
+        "go"
+      ]
+    },
+    {
+      "id": "godot_resource",
+      "name": "Godot Resource",
+      "extensions": [
+        "tres",
+        "tscn"
+      ]
+    },
+    {
+      "id": "gomod",
+      "name": "Gomod",
+      "extensions": [
+        "mod"
+      ]
+    },
+    {
+      "id": "gosum",
+      "name": "Gosum",
+      "extensions": []
+    },
+    {
+      "id": "gotmpl",
+      "name": "Gotmpl",
+      "extensions": [
+        "gotmpl"
+      ]
+    },
+    {
+      "id": "gowork",
+      "name": "Gowork",
+      "extensions": []
+    },
+    {
+      "id": "gpg",
+      "name": "Gpg",
+      "extensions": []
+    },
+    {
+      "id": "graphql",
+      "name": "GraphQL",
+      "extensions": [
+        "graphql",
+        "gql"
+      ]
+    },
+    {
+      "id": "gren",
+      "name": "Gren",
+      "extensions": [
+        "gren"
+      ]
+    },
+    {
+      "id": "groovy",
+      "name": "Groovy",
+      "extensions": [
+        "groovy",
+        "gradle"
+      ]
+    },
+    {
+      "id": "gstlaunch",
+      "name": "Gstlaunch",
+      "extensions": []
+    },
+    {
+      "id": "hack",
+      "name": "Hack",
+      "extensions": [
+        "hack"
+      ]
+    },
+    {
+      "id": "haml",
+      "name": "Haml",
+      "extensions": [
+        "haml"
+      ]
+    },
+    {
+      "id": "hare",
+      "name": "Hare",
+      "extensions": [
+        "hare"
+      ]
+    },
+    {
+      "id": "haskell",
+      "name": "Haskell",
+      "extensions": [
+        "hs"
+      ]
+    },
+    {
+      "id": "haskell_persistent",
+      "name": "Haskell Persistent",
+      "extensions": []
+    },
+    {
+      "id": "haxe",
+      "name": "Haxe",
+      "extensions": [
+        "hx"
+      ]
+    },
+    {
+      "id": "hcl",
+      "name": "Hcl",
+      "extensions": [
+        "hcl"
+      ]
+    },
+    {
+      "id": "heex",
+      "name": "Heex",
+      "extensions": [
+        "heex"
+      ]
+    },
+    {
+      "id": "hjson",
+      "name": "Hjson",
+      "extensions": [
+        "hjson"
+      ]
+    },
+    {
+      "id": "hlsl",
+      "name": "HLSL",
+      "extensions": [
+        "hlsl"
+      ]
+    },
+    {
+      "id": "hocon",
+      "name": "Hocon",
+      "extensions": [
+        "hocon"
+      ]
+    },
+    {
+      "id": "hoon",
+      "name": "Hoon",
+      "extensions": [
+        "hoon"
+      ]
+    },
+    {
+      "id": "html",
+      "name": "HTML",
+      "extensions": [
+        "html",
+        "htm"
+      ]
+    },
+    {
+      "id": "htmldjango",
+      "name": "Htmldjango",
+      "extensions": []
+    },
+    {
+      "id": "http",
+      "name": "Http",
+      "extensions": [
+        "http"
+      ]
+    },
+    {
+      "id": "hurl",
+      "name": "Hurl",
+      "extensions": [
+        "hurl"
+      ]
+    },
+    {
+      "id": "hyprlang",
+      "name": "Hyprlang",
+      "extensions": []
+    },
+    {
+      "id": "idl",
+      "name": "Idl",
+      "extensions": [
+        "idl"
+      ]
+    },
+    {
+      "id": "idris",
+      "name": "Idris",
+      "extensions": [
+        "idr"
+      ]
+    },
+    {
+      "id": "ini",
+      "name": "Ini",
+      "extensions": [
+        "ini",
+        "cfg"
+      ]
+    },
+    {
+      "id": "ispc",
+      "name": "Ispc",
+      "extensions": [
+        "ispc"
+      ]
+    },
+    {
+      "id": "jai",
+      "name": "Jai",
+      "extensions": [
+        "jai"
+      ]
+    },
+    {
+      "id": "janet",
+      "name": "Janet",
+      "extensions": [
+        "janet"
+      ]
+    },
+    {
+      "id": "java",
+      "name": "Java",
+      "extensions": [
+        "java"
+      ]
+    },
+    {
+      "id": "javadoc",
+      "name": "Javadoc",
+      "extensions": []
+    },
+    {
+      "id": "javascript",
+      "name": "JavaScript",
+      "extensions": [
+        "js",
+        "jsx",
+        "mjs",
+        "cjs"
+      ]
+    },
+    {
+      "id": "jinja2",
+      "name": "Jinja2",
+      "extensions": [
+        "j2",
+        "jinja2"
+      ]
+    },
+    {
+      "id": "jjdescription",
+      "name": "Jjdescription",
+      "extensions": [
+        "jjdescription"
+      ]
+    },
+    {
+      "id": "jq",
+      "name": "Jq",
+      "extensions": [
+        "jq"
+      ]
+    },
+    {
+      "id": "jsdoc",
+      "name": "Jsdoc",
+      "extensions": []
+    },
+    {
+      "id": "json",
+      "name": "JSON",
+      "extensions": [
+        "json"
+      ]
+    },
+    {
+      "id": "json5",
+      "name": "JSON5",
+      "extensions": [
+        "json5"
+      ]
+    },
+    {
+      "id": "jsonnet",
+      "name": "Jsonnet",
+      "extensions": [
+        "jsonnet",
+        "libsonnet"
+      ]
+    },
+    {
+      "id": "julia",
+      "name": "Julia",
+      "extensions": [
+        "jl"
+      ]
+    },
+    {
+      "id": "just",
+      "name": "Just",
+      "extensions": [
+        "just"
+      ]
+    },
+    {
+      "id": "kcl",
+      "name": "Kcl",
+      "extensions": [
+        "k"
+      ]
+    },
+    {
+      "id": "kconfig",
+      "name": "Kconfig",
+      "extensions": []
+    },
+    {
+      "id": "kdl",
+      "name": "Kdl",
+      "extensions": [
+        "kdl"
+      ]
+    },
+    {
+      "id": "kitty",
+      "name": "Kitty",
+      "extensions": []
+    },
+    {
+      "id": "koka",
+      "name": "Koka",
+      "extensions": [
+        "kk"
+      ]
+    },
+    {
+      "id": "kotlin",
+      "name": "Kotlin",
+      "extensions": [
+        "kt",
+        "kts"
+      ]
+    },
+    {
+      "id": "koto",
+      "name": "Koto",
+      "extensions": [
+        "koto"
+      ]
+    },
+    {
+      "id": "kusto",
+      "name": "Kusto",
+      "extensions": [
+        "kql"
+      ]
+    },
+    {
+      "id": "lalrpop",
+      "name": "Lalrpop",
+      "extensions": [
+        "lalrpop"
+      ]
+    },
+    {
+      "id": "latex",
+      "name": "Latex",
+      "extensions": [
+        "tex"
+      ]
+    },
+    {
+      "id": "lean",
+      "name": "Lean",
+      "extensions": [
+        "lean"
+      ]
+    },
+    {
+      "id": "ledger",
+      "name": "Ledger",
+      "extensions": [
+        "ldg",
+        "ledger",
+        "journal"
+      ]
+    },
+    {
+      "id": "leo",
+      "name": "Leo",
+      "extensions": [
+        "leo"
+      ]
+    },
+    {
+      "id": "less",
+      "name": "Less",
+      "extensions": [
+        "less"
+      ]
+    },
+    {
+      "id": "linkerscript",
+      "name": "Linkerscript",
+      "extensions": [
+        "lds"
+      ]
+    },
+    {
+      "id": "liquid",
+      "name": "Liquid",
+      "extensions": [
+        "liquid"
+      ]
+    },
+    {
+      "id": "llvm",
+      "name": "Llvm",
+      "extensions": [
+        "ll"
+      ]
+    },
+    {
+      "id": "llvm_mir",
+      "name": "Llvm Mir",
+      "extensions": [
+        "mir"
+      ]
+    },
+    {
+      "id": "lua",
+      "name": "Lua",
+      "extensions": [
+        "lua"
+      ]
+    },
+    {
+      "id": "luadoc",
+      "name": "Luadoc",
+      "extensions": []
+    },
+    {
+      "id": "luap",
+      "name": "Luap",
+      "extensions": []
+    },
+    {
+      "id": "luau",
+      "name": "Luau",
+      "extensions": [
+        "luau"
+      ]
+    },
+    {
+      "id": "m68k",
+      "name": "M68K",
+      "extensions": []
+    },
+    {
+      "id": "magik",
+      "name": "Magik",
+      "extensions": [
+        "magik"
+      ]
+    },
+    {
+      "id": "make",
+      "name": "Makefile",
+      "extensions": [
+        "mk",
+        "makefile"
+      ]
+    },
+    {
+      "id": "markdown",
+      "name": "Markdown",
+      "extensions": [
+        "md",
+        "markdown"
+      ]
+    },
+    {
+      "id": "markdown_inline",
+      "name": "Markdown Inline",
+      "extensions": []
+    },
+    {
+      "id": "matlab",
+      "name": "Matlab",
+      "extensions": [
+        "matlab"
+      ]
+    },
+    {
+      "id": "menhir",
+      "name": "Menhir",
+      "extensions": [
+        "mly"
+      ]
+    },
+    {
+      "id": "mermaid",
+      "name": "Mermaid",
+      "extensions": [
+        "mmd",
+        "mermaid"
+      ]
+    },
+    {
+      "id": "meson",
+      "name": "Meson",
+      "extensions": [
+        "meson"
+      ]
+    },
+    {
+      "id": "mlir",
+      "name": "Mlir",
+      "extensions": [
+        "mlir"
+      ]
+    },
+    {
+      "id": "mojo",
+      "name": "Mojo",
+      "extensions": [
+        "mojo"
+      ]
+    },
+    {
+      "id": "moonbit",
+      "name": "Moonbit",
+      "extensions": [
+        "mbt",
+        "mbti"
+      ]
+    },
+    {
+      "id": "motoko",
+      "name": "Motoko",
+      "extensions": [
+        "mo"
+      ]
+    },
+    {
+      "id": "move",
+      "name": "Move",
+      "extensions": [
+        "move"
+      ]
+    },
+    {
+      "id": "nasm",
+      "name": "Nasm",
+      "extensions": [
+        "nasm"
+      ]
+    },
+    {
+      "id": "netlinx",
+      "name": "Netlinx",
+      "extensions": [
+        "axs",
+        "axi"
+      ]
+    },
+    {
+      "id": "nginx",
+      "name": "Nginx",
+      "extensions": [
+        "conf",
+        "nginx"
+      ]
+    },
+    {
+      "id": "nickel",
+      "name": "Nickel",
+      "extensions": [
+        "ncl"
+      ]
+    },
+    {
+      "id": "nim",
+      "name": "Nim",
+      "extensions": [
+        "nim",
+        "nims"
+      ]
+    },
+    {
+      "id": "ninja",
+      "name": "Ninja",
+      "extensions": [
+        "ninja"
+      ]
+    },
+    {
+      "id": "nix",
+      "name": "Nix",
+      "extensions": [
+        "nix"
+      ]
+    },
+    {
+      "id": "norg",
+      "name": "Norg",
+      "extensions": [
+        "norg"
+      ]
+    },
+    {
+      "id": "norg_meta",
+      "name": "Norg Meta",
+      "extensions": []
+    },
+    {
+      "id": "nqc",
+      "name": "Nqc",
+      "extensions": [
+        "nqc"
+      ]
+    },
+    {
+      "id": "nushell",
+      "name": "Nushell",
+      "extensions": [
+        "nu"
+      ]
+    },
+    {
+      "id": "objc",
+      "name": "Objc",
+      "extensions": [
+        "m"
+      ]
+    },
+    {
+      "id": "ocaml",
+      "name": "OCaml",
+      "extensions": [
+        "ml"
+      ]
+    },
+    {
+      "id": "ocaml_interface",
+      "name": "OCaml interfaces",
+      "extensions": [
+        "mli"
+      ]
+    },
+    {
+      "id": "ocamllex",
+      "name": "Ocamllex",
+      "extensions": [
+        "mll"
+      ]
+    },
+    {
+      "id": "odin",
+      "name": "Odin",
+      "extensions": [
+        "odin"
+      ]
+    },
+    {
+      "id": "openscad",
+      "name": "Openscad",
+      "extensions": [
+        "scad"
+      ]
+    },
+    {
+      "id": "org",
+      "name": "Org",
+      "extensions": [
+        "org"
+      ]
+    },
+    {
+      "id": "pascal",
+      "name": "Pascal",
+      "extensions": [
+        "pas"
+      ]
+    },
+    {
+      "id": "pem",
+      "name": "Pem",
+      "extensions": [
+        "pem"
+      ]
+    },
+    {
+      "id": "penrose",
+      "name": "Penrose",
+      "extensions": [
+        "style",
+        "substance",
+        "domain"
+      ]
+    },
+    {
+      "id": "perl",
+      "name": "Perl",
+      "extensions": [
+        "pl",
+        "pm"
+      ]
+    },
+    {
+      "id": "pgn",
+      "name": "Pgn",
+      "extensions": [
+        "pgn"
+      ]
+    },
+    {
+      "id": "php",
+      "name": "PHP",
+      "extensions": [
+        "php"
+      ]
+    },
+    {
+      "id": "phpdoc",
+      "name": "Phpdoc",
+      "extensions": []
+    },
+    {
+      "id": "picat",
+      "name": "Picat",
+      "extensions": [
+        "pi",
+        "picat"
+      ]
+    },
+    {
+      "id": "pkl",
+      "name": "Pkl",
+      "extensions": [
+        "pkl"
+      ]
+    },
+    {
+      "id": "plantuml",
+      "name": "Plantuml",
+      "extensions": [
+        "puml",
+        "plantuml",
+        "iuml"
+      ]
+    },
+    {
+      "id": "po",
+      "name": "Po",
+      "extensions": [
+        "po",
+        "pot"
+      ]
+    },
+    {
+      "id": "poe_filter",
+      "name": "Poe Filter",
+      "extensions": [
+        "filter"
+      ]
+    },
+    {
+      "id": "pony",
+      "name": "Pony",
+      "extensions": [
+        "pony"
+      ]
+    },
+    {
+      "id": "postgres",
+      "name": "Postgres",
+      "extensions": [
+        "psql",
+        "pgsql"
+      ]
+    },
+    {
+      "id": "postscript",
+      "name": "Postscript",
+      "extensions": [
+        "ps",
+        "eps"
+      ]
+    },
+    {
+      "id": "powershell",
+      "name": "Powershell",
+      "extensions": [
+        "ps1",
+        "psm1",
+        "psd1"
+      ]
+    },
+    {
+      "id": "printf",
+      "name": "Printf",
+      "extensions": []
+    },
+    {
+      "id": "prisma",
+      "name": "Prisma",
+      "extensions": [
+        "prisma"
+      ]
+    },
+    {
+      "id": "prolog",
+      "name": "Prolog",
+      "extensions": [
+        "pro"
+      ]
+    },
+    {
+      "id": "promela",
+      "name": "Promela",
+      "extensions": [
+        "pml"
+      ]
+    },
+    {
+      "id": "promql",
+      "name": "Promql",
+      "extensions": [
+        "promql"
+      ]
+    },
+    {
+      "id": "properties",
+      "name": "Properties",
+      "extensions": [
+        "properties"
+      ]
+    },
+    {
+      "id": "proto",
+      "name": "Proto",
+      "extensions": [
+        "proto"
+      ]
+    },
+    {
+      "id": "prql",
+      "name": "Prql",
+      "extensions": [
+        "prql"
+      ]
+    },
+    {
+      "id": "psv",
+      "name": "Psv",
+      "extensions": [
+        "psv"
+      ]
+    },
+    {
+      "id": "pug",
+      "name": "Pug",
+      "extensions": [
+        "pug"
+      ]
+    },
+    {
+      "id": "puppet",
+      "name": "Puppet",
+      "extensions": [
+        "pp"
+      ]
+    },
+    {
+      "id": "purescript",
+      "name": "Purescript",
+      "extensions": [
+        "purs"
+      ]
+    },
+    {
+      "id": "pymanifest",
+      "name": "Pymanifest",
+      "extensions": []
+    },
+    {
+      "id": "python",
+      "name": "Python",
+      "extensions": [
+        "py",
+        "pyi",
+        "pyw"
+      ]
+    },
+    {
+      "id": "ql",
+      "name": "Ql",
+      "extensions": [
+        "ql"
+      ]
+    },
+    {
+      "id": "qmldir",
+      "name": "Qmldir",
+      "extensions": []
+    },
+    {
+      "id": "qmljs",
+      "name": "Qmljs",
+      "extensions": [
+        "qml"
+      ]
+    },
+    {
+      "id": "query",
+      "name": "Query",
+      "extensions": []
+    },
+    {
+      "id": "r",
+      "name": "R",
+      "extensions": [
+        "r"
+      ]
+    },
+    {
+      "id": "racket",
+      "name": "Racket",
+      "extensions": [
+        "rkt"
+      ]
+    },
+    {
+      "id": "rasi",
+      "name": "Rasi",
+      "extensions": [
+        "rasi"
+      ]
+    },
+    {
+      "id": "razor",
+      "name": "Razor",
+      "extensions": [
+        "razor",
+        "cshtml"
+      ]
+    },
+    {
+      "id": "rbs",
+      "name": "Rbs",
+      "extensions": [
+        "rbs"
+      ]
+    },
+    {
+      "id": "re2c",
+      "name": "Re2C",
+      "extensions": [
+        "re"
+      ]
+    },
+    {
+      "id": "readline",
+      "name": "Readline",
+      "extensions": []
+    },
+    {
+      "id": "reason",
+      "name": "Reason",
+      "extensions": [
+        "rei"
+      ]
+    },
+    {
+      "id": "regex",
+      "name": "Regex",
+      "extensions": []
+    },
+    {
+      "id": "rego",
+      "name": "Rego",
+      "extensions": [
+        "rego"
+      ]
+    },
+    {
+      "id": "requirements",
+      "name": "Requirements",
+      "extensions": []
+    },
+    {
+      "id": "rescript",
+      "name": "Rescript",
+      "extensions": [
+        "res",
+        "resi"
+      ]
+    },
+    {
+      "id": "robot",
+      "name": "Robot",
+      "extensions": [
+        "robot"
+      ]
+    },
+    {
+      "id": "roc",
+      "name": "Roc",
+      "extensions": [
+        "roc"
+      ]
+    },
+    {
+      "id": "ron",
+      "name": "Ron",
+      "extensions": [
+        "ron"
+      ]
+    },
+    {
+      "id": "rshtml",
+      "name": "Rshtml",
+      "extensions": []
+    },
+    {
+      "id": "rst",
+      "name": "reStructuredText",
+      "extensions": [
+        "rst"
+      ]
+    },
+    {
+      "id": "rtf",
+      "name": "Rtf",
+      "extensions": [
+        "rtf"
+      ]
+    },
+    {
+      "id": "ruby",
+      "name": "Ruby",
+      "extensions": [
+        "rb"
+      ]
+    },
+    {
+      "id": "rust",
+      "name": "Rust",
+      "extensions": [
+        "rs"
+      ]
+    },
+    {
+      "id": "sas",
+      "name": "Sas",
+      "extensions": [
+        "sas"
+      ]
+    },
+    {
+      "id": "scala",
+      "name": "Scala",
+      "extensions": [
+        "scala"
+      ]
+    },
+    {
+      "id": "scfg",
+      "name": "Scfg",
+      "extensions": [
+        "scfg"
+      ]
+    },
+    {
+      "id": "scheme",
+      "name": "Scheme",
+      "extensions": [
+        "scm"
+      ]
+    },
+    {
+      "id": "scss",
+      "name": "SCSS",
+      "extensions": [
+        "scss"
+      ]
+    },
+    {
+      "id": "sflog",
+      "name": "Sflog",
+      "extensions": [
+        "sflog"
+      ]
+    },
+    {
+      "id": "slang",
+      "name": "Slang",
+      "extensions": [
+        "slang"
+      ]
+    },
+    {
+      "id": "slim",
+      "name": "Slim",
+      "extensions": [
+        "slim"
+      ]
+    },
+    {
+      "id": "slint",
+      "name": "Slint",
+      "extensions": [
+        "slint"
+      ]
+    },
+    {
+      "id": "smali",
+      "name": "Smali",
+      "extensions": [
+        "smali"
+      ]
+    },
+    {
+      "id": "smalltalk",
+      "name": "Smalltalk",
+      "extensions": [
+        "st"
+      ]
+    },
+    {
+      "id": "smithy",
+      "name": "Smithy",
+      "extensions": [
+        "smithy"
+      ]
+    },
+    {
+      "id": "sml",
+      "name": "Sml",
+      "extensions": [
+        "sml",
+        "sig",
+        "fun"
+      ]
+    },
+    {
+      "id": "snakemake",
+      "name": "Snakemake",
+      "extensions": [
+        "smk"
+      ]
+    },
+    {
+      "id": "snl",
+      "name": "Snl",
+      "extensions": [
+        "stt"
+      ]
+    },
+    {
+      "id": "solidity",
+      "name": "Solidity",
+      "extensions": [
+        "sol"
+      ]
+    },
+    {
+      "id": "soql",
+      "name": "Soql",
+      "extensions": [
+        "soql"
+      ]
+    },
+    {
+      "id": "sosl",
+      "name": "Sosl",
+      "extensions": [
+        "sosl"
+      ]
+    },
+    {
+      "id": "souffle",
+      "name": "Souffle",
+      "extensions": [
+        "dl"
+      ]
+    },
+    {
+      "id": "sourcepawn",
+      "name": "Sourcepawn",
+      "extensions": [
+        "sp",
+        "inc"
+      ]
+    },
+    {
+      "id": "sparql",
+      "name": "Sparql",
+      "extensions": [
+        "sparql"
+      ]
+    },
+    {
+      "id": "spicedb",
+      "name": "Spicedb",
+      "extensions": [
+        "zed"
+      ]
+    },
+    {
+      "id": "sql",
+      "name": "SQL",
+      "extensions": [
+        "sql"
+      ]
+    },
+    {
+      "id": "sql_bigquery",
+      "name": "Sql Bigquery",
+      "extensions": [
+        "bq"
+      ]
+    },
+    {
+      "id": "squirrel",
+      "name": "Squirrel",
+      "extensions": [
+        "squirrel",
+        "nut"
+      ]
+    },
+    {
+      "id": "ssh_config",
+      "name": "Ssh Config",
+      "extensions": []
+    },
+    {
+      "id": "stan",
+      "name": "Stan",
+      "extensions": [
+        "stan"
+      ]
+    },
+    {
+      "id": "starlark",
+      "name": "Starlark",
+      "extensions": [
+        "star",
+        "bzl"
+      ]
+    },
+    {
+      "id": "strace",
+      "name": "Strace",
+      "extensions": [
+        "strace"
+      ]
+    },
+    {
+      "id": "styled",
+      "name": "Styled",
+      "extensions": []
+    },
+    {
+      "id": "superhtml",
+      "name": "Superhtml",
+      "extensions": [
+        "shtml"
+      ]
+    },
+    {
+      "id": "svelte",
+      "name": "Svelte",
+      "extensions": [
+        "svelte"
+      ]
+    },
+    {
+      "id": "sway",
+      "name": "Sway",
+      "extensions": [
+        "sw"
+      ]
+    },
+    {
+      "id": "swift",
+      "name": "Swift",
+      "extensions": [
+        "swift"
+      ]
+    },
+    {
+      "id": "sxhkdrc",
+      "name": "Sxhkdrc",
+      "extensions": [
+        "sxhkdrc"
+      ]
+    },
+    {
+      "id": "sysml",
+      "name": "Sysml",
+      "extensions": [
+        "sysml"
+      ]
+    },
+    {
+      "id": "systemtap",
+      "name": "Systemtap",
+      "extensions": [
+        "stp",
+        "stpm"
+      ]
+    },
+    {
+      "id": "systemverilog",
+      "name": "Systemverilog",
+      "extensions": [
+        "sv",
+        "svh"
+      ]
+    },
+    {
+      "id": "t32",
+      "name": "T32",
+      "extensions": [
+        "cmm",
+        "cmmt",
+        "t32"
+      ]
+    },
+    {
+      "id": "tablegen",
+      "name": "Tablegen",
+      "extensions": [
+        "td"
+      ]
+    },
+    {
+      "id": "tact",
+      "name": "Tact",
+      "extensions": [
+        "tact"
+      ]
+    },
+    {
+      "id": "task",
+      "name": "Task",
+      "extensions": [
+        "task"
+      ]
+    },
+    {
+      "id": "tcl",
+      "name": "Tcl",
+      "extensions": [
+        "tcl"
+      ]
+    },
+    {
+      "id": "teal",
+      "name": "Teal",
+      "extensions": [
+        "tl"
+      ]
+    },
+    {
+      "id": "templ",
+      "name": "Templ",
+      "extensions": [
+        "templ"
+      ]
+    },
+    {
+      "id": "tera",
+      "name": "Tera",
+      "extensions": [
+        "tera"
+      ]
+    },
+    {
+      "id": "terraform",
+      "name": "Terraform",
+      "extensions": [
+        "tf",
+        "tfvars"
+      ]
+    },
+    {
+      "id": "test",
+      "name": "Test",
+      "extensions": []
+    },
+    {
+      "id": "textproto",
+      "name": "Textproto",
+      "extensions": [
+        "textproto",
+        "pbtxt"
+      ]
+    },
+    {
+      "id": "thrift",
+      "name": "Thrift",
+      "extensions": [
+        "thrift"
+      ]
+    },
+    {
+      "id": "tlaplus",
+      "name": "Tlaplus",
+      "extensions": [
+        "tla"
+      ]
+    },
+    {
+      "id": "tmux",
+      "name": "Tmux",
+      "extensions": []
+    },
+    {
+      "id": "todotxt",
+      "name": "Todotxt",
+      "extensions": [
+        "todotxt"
+      ]
+    },
+    {
+      "id": "toml",
+      "name": "TOML",
+      "extensions": [
+        "toml"
+      ]
+    },
+    {
+      "id": "tsql",
+      "name": "Tsql",
+      "extensions": []
+    },
+    {
+      "id": "tsv",
+      "name": "Tsv",
+      "extensions": [
+        "tsv"
+      ]
+    },
+    {
+      "id": "tsx",
+      "name": "TSX",
+      "extensions": [
+        "tsx"
+      ]
+    },
+    {
+      "id": "turtle",
+      "name": "Turtle",
+      "extensions": [
+        "ttl"
+      ]
+    },
+    {
+      "id": "twig",
+      "name": "Twig",
+      "extensions": [
+        "twig"
+      ]
+    },
+    {
+      "id": "typescript",
+      "name": "TypeScript",
+      "extensions": [
+        "ts",
+        "mts",
+        "cts"
+      ]
+    },
+    {
+      "id": "typespec",
+      "name": "Typespec",
+      "extensions": [
+        "tsp"
+      ]
+    },
+    {
+      "id": "typoscript",
+      "name": "Typoscript",
+      "extensions": [
+        "typoscript",
+        "tsconfig"
+      ]
+    },
+    {
+      "id": "typst",
+      "name": "Typst",
+      "extensions": [
+        "typst"
+      ]
+    },
+    {
+      "id": "udev",
+      "name": "Udev",
+      "extensions": []
+    },
+    {
+      "id": "ungrammar",
+      "name": "Ungrammar",
+      "extensions": []
+    },
+    {
+      "id": "unison",
+      "name": "Unison",
+      "extensions": [
+        "u"
+      ]
+    },
+    {
+      "id": "uxntal",
+      "name": "Uxntal",
+      "extensions": [
+        "tal"
+      ]
+    },
+    {
+      "id": "v",
+      "name": "V",
+      "extensions": [
+        "v"
+      ]
+    },
+    {
+      "id": "vala",
+      "name": "Vala",
+      "extensions": [
+        "vala",
+        "vapi"
+      ]
+    },
+    {
+      "id": "vb",
+      "name": "Vb",
+      "extensions": [
+        "vb"
+      ]
+    },
+    {
+      "id": "vento",
+      "name": "Vento",
+      "extensions": [
+        "vto"
+      ]
+    },
+    {
+      "id": "verilog",
+      "name": "Verilog",
+      "extensions": [
+        "verilog"
+      ]
+    },
+    {
+      "id": "vhdl",
+      "name": "Vhdl",
+      "extensions": [
+        "vhdl",
+        "vhd"
+      ]
+    },
+    {
+      "id": "vhs",
+      "name": "Vhs",
+      "extensions": [
+        "tape"
+      ]
+    },
+    {
+      "id": "vim",
+      "name": "Vim",
+      "extensions": [
+        "vim"
+      ]
+    },
+    {
+      "id": "vimdoc",
+      "name": "Vimdoc",
+      "extensions": [
+        "txt"
+      ]
+    },
+    {
+      "id": "vrl",
+      "name": "Vrl",
+      "extensions": [
+        "vrl"
+      ]
+    },
+    {
+      "id": "vue",
+      "name": "Vue",
+      "extensions": [
+        "vue"
+      ]
+    },
+    {
+      "id": "wast",
+      "name": "Wast",
+      "extensions": [
+        "wast"
+      ]
+    },
+    {
+      "id": "wat",
+      "name": "Wat",
+      "extensions": [
+        "wat"
+      ]
+    },
+    {
+      "id": "wdl",
+      "name": "Wdl",
+      "extensions": [
+        "wdl"
+      ]
+    },
+    {
+      "id": "wgsl",
+      "name": "WGSL",
+      "extensions": [
+        "wgsl"
+      ]
+    },
+    {
+      "id": "wgsl_bevy",
+      "name": "Wgsl Bevy",
+      "extensions": []
+    },
+    {
+      "id": "wit",
+      "name": "Wit",
+      "extensions": [
+        "wit"
+      ]
+    },
+    {
+      "id": "wolfram",
+      "name": "Wolfram",
+      "extensions": [
+        "wl",
+        "wls"
+      ]
+    },
+    {
+      "id": "x86asm",
+      "name": "X86Asm",
+      "extensions": []
+    },
+    {
+      "id": "xcompose",
+      "name": "Xcompose",
+      "extensions": []
+    },
+    {
+      "id": "xit",
+      "name": "Xit",
+      "extensions": [
+        "xit"
+      ]
+    },
+    {
+      "id": "xml",
+      "name": "XML",
+      "extensions": [
+        "xml",
+        "xsl",
+        "xslt"
+      ]
+    },
+    {
+      "id": "xquery",
+      "name": "Xquery",
+      "extensions": [
+        "xq",
+        "xqy",
+        "xquery"
+      ]
+    },
+    {
+      "id": "xresources",
+      "name": "Xresources",
+      "extensions": [
+        "xresources",
+        "xdefaults"
+      ]
+    },
+    {
+      "id": "yaml",
+      "name": "YAML",
+      "extensions": [
+        "yaml",
+        "yml"
+      ]
+    },
+    {
+      "id": "yang",
+      "name": "Yang",
+      "extensions": [
+        "yang"
+      ]
+    },
+    {
+      "id": "yuck",
+      "name": "Yuck",
+      "extensions": [
+        "yuck"
+      ]
+    },
+    {
+      "id": "yul",
+      "name": "Yul",
+      "extensions": [
+        "yul"
+      ]
+    },
+    {
+      "id": "zig",
+      "name": "Zig",
+      "extensions": [
+        "zig"
+      ]
+    },
+    {
+      "id": "ziggy",
+      "name": "Ziggy",
+      "extensions": [
+        "ziggy"
+      ]
+    },
+    {
+      "id": "ziggy_schema",
+      "name": "Ziggy Schema",
+      "extensions": []
+    },
+    {
+      "id": "zsh",
+      "name": "Zsh",
+      "extensions": [
+        "zsh"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 200" fill="none">
+  <title>A reference article with contents, an illustration, and source links</title>
+  <path fill="#edeae5" d="M0 0h560v200H0z"/>
+  <path fill="#f7f5ef" stroke="#c6c0b9" d="M95 18h370v164H95z"/>
+  <path stroke="#c6c0b9" d="M213 18v164"/>
+  <g fill="#292522" font-family="Arial,sans-serif"><text x="112" y="43" font-size="10" letter-spacing="1.2">CONTENTS</text><text x="232" y="47" font-size="22">Reference</text><text x="232" y="161" font-size="10">Sources &amp; further reading</text></g>
+  <g stroke="#aaa29a" stroke-linecap="round"><path d="M113 61h69m-69 16h58m-58 16h72m-72 16h53m179-37h99m-99 13h110m-110 13h91M232 119h205m-205 13h187m-187 40h142"/></g>
+  <circle cx="266" cy="86" r="22" stroke="#b92721"/>
+  <path stroke="#b92721" d="M244 86h44m-22-22c-17 15-17 29 0 44 17-15 17-29 0-44Zm-18-12c13 5 25 5 36 0m-36 24c13-5 25-5 36 0"/>
+  <path stroke="#b92721" stroke-width="2" d="M112 127h37M232 55h39"/>
+</svg>

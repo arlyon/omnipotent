@@ -1,0 +1,3 @@
+Six four-colour e-paper interface concepts. Each numbered state has an editable SVG, an indexed four-colour PNG, and four transparent PNG ink separations. All ink layers share the same origin. Stack them at 100 percent opacity to reconstruct the indexed PNG.
+BAT indicates battery charge. USED indicates occupied storage. UP is uptime in days. Telemetry values are illustrative.
+The 296 by 160 artwork grid follows the supplied active area's proportions. Confirm the controller's native pixel dimensions and palette mapping before a hardware export. SVG text uses the DejaVu Sans and DejaVu Sans Mono families. The indexed PNG preserves the intended lettering on systems without those fonts.

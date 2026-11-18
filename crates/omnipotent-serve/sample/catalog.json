@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "title": "Omnipotent connection check",
+    "numberOfItems": 1
+  },
+  "links": [
+    {"rel": "self", "href": "/opds", "type": "application/opds+json"}
+  ],
+  "publications": [
+    {
+      "metadata": {
+        "identifier": "urn:omnipotent:sample:connection-check",
+        "title": "Connected to Omnipotent",
+        "author": [{"name": "Omnipotent"}],
+        "language": "en"
+      },
+      "links": [
+        {
+          "rel": "http://opds-spec.org/acquisition/open-access",
+          "href": "/books/connection-check.epub",
+          "type": "application/epub+zip",
+          "title": "Download the connection-check book"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,2105 @@
+use crate::compat::Arc;
+use crate::compat::Mutex;
+use crate::tree_store::page_store::compression::{
+    CompressionConfig, compress_value, decompress_value,
+};
+use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory, xxh3_checksum};
+use crate::tree_store::{PageNumber, PageTrackerPolicy};
+use crate::types::{Key, MutInPlaceValue, Value};
+use crate::{Result, StorageError};
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::vec::Vec;
+use core::borrow::Borrow;
+use core::cmp::Ordering;
+use core::marker::PhantomData;
+use core::mem::size_of;
+use core::ops::Range;
+
+pub(crate) const LEAF: u8 = 1;
+pub(crate) const BRANCH: u8 = 2;
+
+pub(crate) type Checksum = u128;
+// Dummy value. Final value will be computed during commit
+pub(crate) const DEFERRED: Checksum = 999;
+
+pub(super) fn leaf_checksum<T: Page>(
+    page: &T,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+) -> Result<Checksum, StorageError> {
+    let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size)?;
+    let last_pair = accessor.num_pairs().checked_sub(1).ok_or_else(|| {
+        StorageError::page_corrupted(page.get_page_number(), "leaf page has zero pairs")
+    })?;
+    let end = accessor.value_end(last_pair).ok_or_else(|| {
+        StorageError::page_corrupted(page.get_page_number(), "leaf page has invalid pair offset")
+    })?;
+    if end > page.memory().len() {
+        Err(StorageError::page_corrupted(
+            page.get_page_number(),
+            "leaf page last offset beyond end of data",
+        ))
+    } else {
+        Ok(xxh3_checksum(&page.memory()[..end]))
+    }
+}
+
+pub(super) fn branch_checksum<T: Page>(
+    page: &T,
+    fixed_key_size: Option<usize>,
+) -> Result<Checksum, StorageError> {
+    let accessor = BranchAccessor::new(page, fixed_key_size)?;
+    let last_key = accessor.num_keys().checked_sub(1).ok_or_else(|| {
+        StorageError::page_corrupted(page.get_page_number(), "branch page has zero keys")
+    })?;
+    let end = accessor.key_end(last_key).ok_or_else(|| {
+        StorageError::page_corrupted(page.get_page_number(), "branch page has invalid key offset")
+    })?;
+    if end > page.memory().len() {
+        Err(StorageError::page_corrupted(
+            page.get_page_number(),
+            "branch page last offset beyond end of data",
+        ))
+    } else {
+        Ok(xxh3_checksum(&page.memory()[..end]))
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct BtreeHeader {
+    pub(crate) root: PageNumber,
+    pub(crate) checksum: Checksum,
+    pub(crate) length: u64,
+}
+
+impl BtreeHeader {
+    pub(crate) fn new(root: PageNumber, checksum: Checksum, length: u64) -> Self {
+        Self {
+            root,
+            checksum,
+            length,
+        }
+    }
+
+    pub(crate) const fn serialized_size() -> usize {
+        PageNumber::serialized_size() + size_of::<Checksum>() + size_of::<u64>()
+    }
+
+    pub(crate) fn from_le_bytes(bytes: [u8; Self::serialized_size()]) -> Self {
+        // All slice lengths are compile-time constants derived from the input
+        // array size, so these conversions are infallible.
+        let mut page_bytes = [0u8; PageNumber::serialized_size()];
+        page_bytes.copy_from_slice(&bytes[..PageNumber::serialized_size()]);
+        let root = PageNumber::from_le_bytes(page_bytes);
+        let mut offset = PageNumber::serialized_size();
+        let mut cksum_bytes = [0u8; size_of::<Checksum>()];
+        cksum_bytes.copy_from_slice(&bytes[offset..(offset + size_of::<Checksum>())]);
+        let checksum = Checksum::from_le_bytes(cksum_bytes);
+        offset += size_of::<Checksum>();
+        let mut len_bytes = [0u8; size_of::<u64>()];
+        len_bytes.copy_from_slice(&bytes[offset..(offset + size_of::<u64>())]);
+        let length = u64::from_le_bytes(len_bytes);
+
+        Self {
+            root,
+            checksum,
+            length,
+        }
+    }
+
+    pub(crate) fn to_le_bytes(self) -> [u8; Self::serialized_size()] {
+        let mut result = [0; Self::serialized_size()];
+        result[..PageNumber::serialized_size()].copy_from_slice(&self.root.to_le_bytes());
+        result[PageNumber::serialized_size()
+            ..(PageNumber::serialized_size() + size_of::<Checksum>())]
+            .copy_from_slice(&self.checksum.to_le_bytes());
+        result[(PageNumber::serialized_size() + size_of::<Checksum>())..]
+            .copy_from_slice(&self.length.to_le_bytes());
+
+        result
+    }
+}
+
+enum OnDrop {
+    None,
+    RemoveEntry {
+        position: usize,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+    },
+}
+
+enum EitherPage {
+    Immutable(PageImpl),
+    Mutable(PageMut),
+    OwnedMemory(Vec<u8>),
+    ArcMemory(Arc<[u8]>),
+}
+
+impl EitherPage {
+    fn memory(&self) -> &[u8] {
+        match self {
+            EitherPage::Immutable(page) => page.memory(),
+            EitherPage::Mutable(page) => page.memory(),
+            EitherPage::OwnedMemory(mem) => mem.as_slice(),
+            EitherPage::ArcMemory(mem) => mem,
+        }
+    }
+}
+
+/// Scoped accessor to data in the database
+///
+/// When this structure is dropped (goes out of scope), the data is released
+pub struct AccessGuard<'a, V: Value + 'static> {
+    page: EitherPage,
+    offset: usize,
+    len: usize,
+    on_drop: OnDrop,
+    // Boxed to minimize struct size -- AccessGuard is returned from recursive B-tree
+    // operations, and every byte matters for stack depth on Windows (1MB default stack).
+    decompressed_value: Option<Box<[u8]>>,
+    _value_type: PhantomData<V>,
+    // Used so that logical references into a Table respect the appropriate lifetime
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<V: Value + 'static> AccessGuard<'_, V> {
+    pub(crate) fn with_page(page: PageImpl, range: Range<usize>) -> Self {
+        Self {
+            page: EitherPage::Immutable(page),
+            offset: range.start,
+            len: range.len(),
+            on_drop: OnDrop::None,
+            decompressed_value: None,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+
+    /// Construct an `AccessGuard` for a value, decompressing if needed.
+    /// Only call for values from compressed databases.
+    pub(crate) fn with_page_decompress(page: PageImpl, range: Range<usize>) -> Result<Self> {
+        let raw = &page.memory()[range.clone()];
+        match decompress_value(raw)? {
+            Cow::Borrowed(_) => {
+                // Uncompressed passthrough -- flags byte stripped, data starts at offset+1
+                Ok(Self::with_page(page, (range.start + 1)..range.end))
+            }
+            Cow::Owned(decompressed) => Ok(Self::with_owned_value(decompressed)),
+        }
+    }
+
+    pub(crate) fn with_arc_page(page: Arc<[u8]>, range: Range<usize>) -> Self {
+        Self {
+            page: EitherPage::ArcMemory(page),
+            offset: range.start,
+            len: range.len(),
+            on_drop: OnDrop::None,
+            decompressed_value: None,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+
+    /// Construct an `AccessGuard` for a value from an Arc page, decompressing if needed.
+    pub(crate) fn with_arc_page_decompress(page: Arc<[u8]>, range: Range<usize>) -> Result<Self> {
+        let raw = &page[range.clone()];
+        match decompress_value(raw)? {
+            Cow::Borrowed(_) => {
+                // Uncompressed -- flags byte stripped, skip 1 byte
+                Ok(Self::with_arc_page(page, (range.start + 1)..range.end))
+            }
+            Cow::Owned(decompressed) => Ok(Self::with_owned_value(decompressed)),
+        }
+    }
+
+    pub(crate) fn with_owned_value(value: Vec<u8>) -> Self {
+        let len = value.len();
+        Self {
+            page: EitherPage::OwnedMemory(value),
+            offset: 0,
+            len,
+            on_drop: OnDrop::None,
+            decompressed_value: None,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+
+    /// Construct an `AccessGuard` with an owned value, decompressing if needed.
+    pub(crate) fn with_owned_value_decompress(value: Vec<u8>) -> Result<Self> {
+        match decompress_value(&value)? {
+            Cow::Borrowed(_) => {
+                // Not compressed envelope -- strip flags byte
+                Ok(Self::with_owned_value(value[1..].to_vec()))
+            }
+            Cow::Owned(decompressed) => Ok(Self::with_owned_value(decompressed)),
+        }
+    }
+
+    pub(super) fn remove_on_drop(
+        page: PageMut,
+        offset: usize,
+        len: usize,
+        position: usize,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+    ) -> Self {
+        Self {
+            page: EitherPage::Mutable(page),
+            offset,
+            len,
+            on_drop: OnDrop::RemoveEntry {
+                position,
+                fixed_key_size,
+                fixed_value_size,
+            },
+            decompressed_value: None,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+
+    /// Construct a remove-on-drop `AccessGuard` with decompression.
+    pub(super) fn remove_on_drop_decompress(
+        page: PageMut,
+        offset: usize,
+        len: usize,
+        position: usize,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+    ) -> Result<Self> {
+        let end = offset.saturating_add(len);
+        if end > page.memory().len() {
+            return Err(StorageError::Corrupted(format!(
+                "AccessGuard: offset {offset} + len {len} exceeds page size {}",
+                page.memory().len()
+            )));
+        }
+        let raw = &page.memory()[offset..end];
+        let decompressed_value = match decompress_value(raw)? {
+            Cow::Borrowed(_) => {
+                // Uncompressed -- strip flags byte
+                Some(raw[1..].to_vec().into_boxed_slice())
+            }
+            Cow::Owned(decompressed) => Some(decompressed.into_boxed_slice()),
+        };
+        Ok(Self {
+            page: EitherPage::Mutable(page),
+            offset,
+            len,
+            on_drop: OnDrop::RemoveEntry {
+                position,
+                fixed_key_size,
+                fixed_value_size,
+            },
+            decompressed_value,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        })
+    }
+
+    /// Access the stored value
+    pub fn value(&self) -> V::SelfType<'_> {
+        if let Some(ref decompressed) = self.decompressed_value {
+            V::from_bytes(decompressed)
+        } else {
+            let mem = self.page.memory();
+            let end = self.offset.saturating_add(self.len).min(mem.len());
+            let start = self.offset.min(end);
+            V::from_bytes(&mem[start..end])
+        }
+    }
+
+    /// Access the stored value, catching panics from corrupt data.
+    ///
+    /// On `std` builds, wraps `Value::from_bytes` in `catch_unwind` so that
+    /// deserialization panics (e.g. from corrupted on-disk metadata) are
+    /// converted to `StorageError::Corrupted` instead of aborting the process.
+    /// On `no_std` builds, calls `from_bytes` directly (panics on corrupt data).
+    #[cfg(feature = "std")]
+    pub(crate) fn value_checked(
+        &self,
+    ) -> core::result::Result<V::SelfType<'_>, crate::StorageError> {
+        let bytes: &[u8] = if let Some(ref decompressed) = self.decompressed_value {
+            decompressed
+        } else {
+            let mem = self.page.memory();
+            let end = self.offset.saturating_add(self.len).min(mem.len());
+            let start = self.offset.min(end);
+            &mem[start..end]
+        };
+        // SAFETY: catch_unwind requires UnwindSafe. The byte slice reference
+        // does not have interior mutability, so AssertUnwindSafe is sound.
+        let ptr = bytes.as_ptr();
+        let len = bytes.len();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Reconstruct the slice inside the closure so the borrow checker
+            // does not complain about capturing a local reference.
+            let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+            V::from_bytes(slice)
+        }))
+        .map_err(|_| {
+            crate::StorageError::Corrupted(alloc::string::String::from(
+                "panic in Value::from_bytes (corrupted metadata)",
+            ))
+        })
+    }
+
+    /// `no_std` fallback: calls `from_bytes` directly (no panic protection).
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn value_checked(
+        &self,
+    ) -> core::result::Result<V::SelfType<'_>, crate::StorageError> {
+        Ok(self.value())
+    }
+}
+
+impl<V: Value + 'static> Drop for AccessGuard<'_, V> {
+    fn drop(&mut self) {
+        match self.on_drop {
+            OnDrop::None => {}
+            OnDrop::RemoveEntry {
+                position,
+                fixed_key_size,
+                fixed_value_size,
+            } => {
+                if let EitherPage::Mutable(ref mut mut_page) = self.page {
+                    if let Ok(mem) = mut_page.memory_mut() {
+                        let mut mutator = LeafMutator::new(mem, fixed_key_size, fixed_value_size);
+                        let _ = mutator.remove(position);
+                    }
+                } else {
+                    let is_panicking = {
+                        #[cfg(feature = "std")]
+                        {
+                            std::thread::panicking()
+                        }
+                        #[cfg(not(feature = "std"))]
+                        {
+                            false
+                        }
+                    };
+                    assert!(
+                        is_panicking,
+                        "AccessGuard with RemoveEntry on-drop requires a mutable page, but page was immutable"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub struct AccessGuardMut<'a, V: Value + 'static> {
+    page: PageMut,
+    offset: usize,
+    len: usize,
+    entry_index: usize,
+    parent: Option<(PageMut, usize)>,
+    mem: Arc<TransactionalMemory>,
+    allocated: Arc<Mutex<PageTrackerPolicy>>,
+    root_ref: &'a mut BtreeHeader,
+    key_width: Option<usize>,
+    fixed_value_size: Option<usize>,
+    compression: CompressionConfig,
+    decompressed_value: Option<Box<[u8]>>,
+    _value_type: PhantomData<V>,
+}
+
+impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        page: PageMut,
+        offset: usize,
+        len: usize,
+        entry_index: usize,
+        parent: Option<(PageMut, usize)>,
+        mem: Arc<TransactionalMemory>,
+        allocated: Arc<Mutex<PageTrackerPolicy>>,
+        root_ref: &'a mut BtreeHeader,
+        key_width: Option<usize>,
+        fixed_value_size: Option<usize>,
+        compression: CompressionConfig,
+    ) -> Result<Self> {
+        // Same condition as `insert_inplace_helper`, same reason it cannot be an
+        // assertion: both page numbers come from a tree walked off disk, so a
+        // corrupt file reaches here with a committed page. This function
+        // already returns `Corrupted` for the bounds check a few lines below.
+        if !mem.uncommitted(page.get_page_number()) {
+            return Err(StorageError::Corrupted(format!(
+                "AccessGuardMut: page {:?} was not allocated by this transaction",
+                page.get_page_number()
+            )));
+        }
+        if let Some((ref parent_page, _)) = parent
+            && !mem.uncommitted(parent_page.get_page_number())
+        {
+            return Err(StorageError::Corrupted(format!(
+                "AccessGuardMut: parent page {:?} was not allocated by this transaction",
+                parent_page.get_page_number()
+            )));
+        }
+        let decompressed_value = if compression.is_enabled() && len > 0 {
+            let end = offset.saturating_add(len);
+            if end > page.memory().len() {
+                return Err(StorageError::Corrupted(format!(
+                    "AccessGuardMut: offset {offset} + len {len} exceeds page size {}",
+                    page.memory().len()
+                )));
+            }
+            let raw = &page.memory()[offset..end];
+            let decompressed = decompress_value(raw)?;
+            match decompressed {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(v) => Some(v.into_boxed_slice()),
+            }
+        } else {
+            None
+        };
+        Ok(AccessGuardMut {
+            page,
+            offset,
+            len,
+            entry_index,
+            parent,
+            mem,
+            allocated,
+            root_ref,
+            key_width,
+            fixed_value_size,
+            compression,
+            decompressed_value,
+            _value_type: Default::default(),
+        })
+    }
+
+    /// Access the stored value
+    pub fn value(&self) -> V::SelfType<'_> {
+        if let Some(ref decompressed) = self.decompressed_value {
+            V::from_bytes(decompressed)
+        } else if self.compression.is_enabled() && self.len > 0 {
+            // Flags byte 0x00 passthrough: strip it
+            V::from_bytes(&self.page.memory()[(self.offset + 1)..(self.offset + self.len)])
+        } else {
+            V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
+        }
+    }
+
+    /// Replace the stored value
+    pub fn insert<'v>(&mut self, value: impl Borrow<V::SelfType<'v>>) -> Result<()> {
+        let raw_value_bytes = V::as_bytes(value.borrow());
+        let stored_value = if self.compression.is_enabled() {
+            compress_value(raw_value_bytes.as_ref(), self.compression)
+        } else {
+            raw_value_bytes.as_ref().to_vec()
+        };
+
+        let key_bytes = {
+            let accessor =
+                LeafAccessor::new(self.page.memory(), self.key_width, self.fixed_value_size)?;
+            accessor.key_unchecked(self.entry_index).to_vec()
+        };
+
+        if LeafMutator::sufficient_insert_inplace_space(
+            &self.page,
+            self.entry_index,
+            true,
+            self.key_width,
+            self.fixed_value_size,
+            key_bytes.as_slice(),
+            &stored_value,
+        ) {
+            let mut mutator = LeafMutator::new(
+                self.page.memory_mut()?,
+                self.key_width,
+                self.fixed_value_size,
+            );
+            mutator.insert(self.entry_index, true, &key_bytes, &stored_value)?;
+        } else {
+            let accessor =
+                LeafAccessor::new(self.page.memory(), self.key_width, self.fixed_value_size)?;
+            let mut builder = LeafBuilder::new(
+                &self.mem,
+                &self.allocated,
+                accessor.num_pairs(),
+                self.key_width,
+                self.fixed_value_size,
+            );
+
+            for i in 0..accessor.num_pairs() {
+                if i == self.entry_index {
+                    builder.push(&key_bytes, &stored_value);
+                } else {
+                    // `entry` returns None when the offsets on the page name a
+                    // range outside it. That used to panic inside `entry`
+                    // itself; making it fallible only moved the panic here
+                    // unless the caller handles it.
+                    let entry = accessor.entry(i).ok_or_else(|| {
+                        StorageError::Corrupted(format!(
+                            "leaf entry {i} is unreadable: offsets name a range outside the page"
+                        ))
+                    })?;
+                    builder.push(entry.key(), entry.value());
+                }
+            }
+
+            let new_page = builder.build()?;
+
+            // Update parent branch page if it exists, otherwise update root
+            if let Some((ref mut parent_page, parent_entry_index)) = self.parent {
+                let mut mutator = BranchMutator::new(parent_page.memory_mut()?);
+                mutator.write_child_page(parent_entry_index, new_page.get_page_number(), DEFERRED);
+            } else {
+                self.root_ref.root = new_page.get_page_number();
+                self.root_ref.checksum = DEFERRED;
+            }
+
+            let old_page_number = self.page.get_page_number();
+            self.page = new_page;
+            let mut allocated = self.allocated.lock();
+            assert!(
+                self.mem
+                    .free_if_uncommitted(old_page_number, &mut allocated)?
+            );
+        }
+
+        // Update our page reference to the new page and recalculate offset/length
+        let new_accessor =
+            LeafAccessor::new(self.page.memory(), self.key_width, self.fixed_value_size)?;
+        let (new_start, new_end) = new_accessor.value_range(self.entry_index).unwrap();
+
+        self.offset = new_start;
+        self.len = new_end - new_start;
+
+        // Update decompressed value cache
+        if self.compression.is_enabled() && self.len > 0 {
+            let raw = &self.page.memory()[self.offset..(self.offset + self.len)];
+            self.decompressed_value = match decompress_value(raw)? {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(v) => Some(v.into_boxed_slice()),
+            };
+        } else {
+            self.decompressed_value = None;
+        }
+
+        Ok(())
+    }
+}
+
+pub struct AccessGuardMutInPlace<'a, V: Value + 'static> {
+    page: PageMut,
+    offset: usize,
+    len: usize,
+    _value_type: PhantomData<V>,
+    // Used so that logical references into a Table respect the appropriate lifetime
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<V: Value + 'static> AccessGuardMutInPlace<'_, V> {
+    pub(crate) fn new(page: PageMut, offset: usize, len: usize) -> Self {
+        AccessGuardMutInPlace {
+            page,
+            offset,
+            len,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+}
+
+impl<V: MutInPlaceValue + 'static> AsMut<V::BaseRefType> for AccessGuardMutInPlace<'_, V> {
+    fn as_mut(&mut self) -> &mut V::BaseRefType {
+        let mem = self
+            .page
+            .memory_mut()
+            .expect("AccessGuardMutInPlace requires exclusive page access");
+        V::from_bytes_mut(&mut mem[self.offset..(self.offset + self.len)])
+    }
+}
+
+// Provides a simple zero-copy way to access entries
+pub struct EntryAccessor<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+}
+
+impl<'a> EntryAccessor<'a> {
+    fn new(key: &'a [u8], value: &'a [u8]) -> Self {
+        EntryAccessor { key, value }
+    }
+}
+
+impl<'a: 'b, 'b> EntryAccessor<'a> {
+    pub(crate) fn key(&'b self) -> &'a [u8] {
+        self.key
+    }
+
+    pub(crate) fn value(&'b self) -> &'a [u8] {
+        self.value
+    }
+}
+
+// Provides a simple zero-copy way to access a leaf page
+pub(crate) struct LeafAccessor<'a> {
+    page: &'a [u8],
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+    num_pairs: usize,
+}
+
+impl<'a> LeafAccessor<'a> {
+    pub(crate) fn new(
+        page: &'a [u8],
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+    ) -> core::result::Result<Self, StorageError> {
+        if page.len() < 4 {
+            return Err(StorageError::Corrupted(
+                "Leaf page too small for header".into(),
+            ));
+        }
+        debug_assert_eq!(page[0], LEAF);
+        let num_pairs = u16::from_le_bytes(
+            page[2..4]
+                .try_into()
+                .map_err(|_| StorageError::Corrupted("Leaf page: bad num_pairs".into()))?,
+        ) as usize;
+        let mut min_size = 4usize;
+        if fixed_key_size.is_none() {
+            min_size = min_size.saturating_add(size_of::<u32>().saturating_mul(num_pairs));
+        }
+        if fixed_value_size.is_none() {
+            min_size = min_size.saturating_add(size_of::<u32>().saturating_mul(num_pairs));
+        }
+        if min_size > page.len() {
+            return Err(StorageError::Corrupted(format!(
+                "Leaf page: num_pairs={num_pairs} requires {min_size}B for offset tables, page is {}B",
+                page.len()
+            )));
+        }
+        Ok(LeafAccessor {
+            page,
+            fixed_key_size,
+            fixed_value_size,
+            num_pairs,
+        })
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn print_node<K: Key, V: Value>(&self, include_value: bool) {
+        let mut i = 0;
+        while let Some(entry) = self.entry(i) {
+            eprint!(" key_{i}={:?}", K::from_bytes(entry.key()));
+            if include_value {
+                eprint!(" value_{i}={:?}", V::from_bytes(entry.value()));
+            }
+            i += 1;
+        }
+    }
+
+    pub(crate) fn position<K: Key>(&self, query: &[u8]) -> (usize, bool) {
+        // inclusive
+        let mut min_entry = 0;
+        // inclusive. Start past end, since it might be positioned beyond the end of the leaf
+        let mut max_entry = self.num_pairs();
+        while min_entry < max_entry {
+            let mid = min_entry.midpoint(max_entry);
+            let key = self.key_unchecked(mid);
+            match K::compare(query, key) {
+                Ordering::Less => {
+                    max_entry = mid;
+                }
+                Ordering::Equal => {
+                    return (mid, true);
+                }
+                Ordering::Greater => {
+                    min_entry = mid + 1;
+                }
+            }
+        }
+        debug_assert_eq!(min_entry, max_entry);
+        (min_entry, false)
+    }
+
+    pub(crate) fn find_key<K: Key>(&self, query: &[u8]) -> Option<usize> {
+        let (entry, found) = self.position::<K>(query);
+        if found { Some(entry) } else { None }
+    }
+
+    fn key_section_start(&self) -> usize {
+        let mut offset = 4;
+        if self.fixed_key_size.is_none() {
+            offset += size_of::<u32>() * self.num_pairs;
+        }
+        if self.fixed_value_size.is_none() {
+            offset += size_of::<u32>() * self.num_pairs;
+        }
+
+        offset
+    }
+
+    fn key_start(&self, n: usize) -> Option<usize> {
+        if n == 0 {
+            Some(self.key_section_start())
+        } else {
+            self.key_end(n - 1)
+        }
+    }
+
+    fn key_end(&self, n: usize) -> Option<usize> {
+        if n >= self.num_pairs() {
+            None
+        } else {
+            if let Some(fixed) = self.fixed_key_size {
+                return Some(self.key_section_start() + fixed * (n + 1));
+            }
+            let offset = 4 + size_of::<u32>() * n;
+            let end = u32::from_le_bytes(
+                self.page
+                    .get(offset..(offset + size_of::<u32>()))?
+                    .try_into()
+                    .ok()?,
+            ) as usize;
+            Some(end)
+        }
+    }
+
+    fn value_start(&self, n: usize) -> Option<usize> {
+        if self.num_pairs() == 0 {
+            return None;
+        }
+        if n == 0 {
+            self.key_end(self.num_pairs() - 1)
+        } else {
+            self.value_end(n - 1)
+        }
+    }
+
+    fn value_end(&self, n: usize) -> Option<usize> {
+        if n >= self.num_pairs() {
+            None
+        } else {
+            if let Some(fixed) = self.fixed_value_size {
+                return Some(self.key_end(self.num_pairs.checked_sub(1)?)? + fixed * (n + 1));
+            }
+            let mut offset = 4 + size_of::<u32>() * n;
+            if self.fixed_key_size.is_none() {
+                offset += size_of::<u32>() * self.num_pairs;
+            }
+            let end = u32::from_le_bytes(
+                self.page
+                    .get(offset..(offset + size_of::<u32>()))?
+                    .try_into()
+                    .ok()?,
+            ) as usize;
+            Some(end)
+        }
+    }
+
+    pub(crate) fn num_pairs(&self) -> usize {
+        self.num_pairs
+    }
+
+    pub(super) fn offset_of_first_value(&self) -> usize {
+        self.offset_of_value(0).unwrap_or(0)
+    }
+
+    pub(super) fn offset_of_value(&self, n: usize) -> Option<usize> {
+        self.value_start(n)
+    }
+
+    pub(super) fn value_range(&self, n: usize) -> Option<(usize, usize)> {
+        Some((self.value_start(n)?, self.value_end(n)?))
+    }
+
+    // Returns the length of all keys and values between [start, end)
+    pub(crate) fn length_of_pairs(&self, start: usize, end: usize) -> usize {
+        self.length_of_values(start, end) + self.length_of_keys(start, end)
+    }
+
+    fn length_of_values(&self, start: usize, end: usize) -> usize {
+        if end == 0 {
+            return 0;
+        }
+        let end_offset = self.value_end(end - 1).unwrap_or(0);
+        let start_offset = self.value_start(start).unwrap_or(0);
+        end_offset.saturating_sub(start_offset)
+    }
+
+    // Returns the length of all keys between [start, end)
+    pub(crate) fn length_of_keys(&self, start: usize, end: usize) -> usize {
+        if end == 0 {
+            return 0;
+        }
+        let end_offset = self.key_end(end - 1).unwrap_or(0);
+        let start_offset = self.key_start(start).unwrap_or(0);
+        end_offset.saturating_sub(start_offset)
+    }
+
+    pub(crate) fn total_length(&self) -> usize {
+        if self.num_pairs == 0 {
+            return self.key_section_start();
+        }
+        // Values are stored last
+        self.value_end(self.num_pairs() - 1)
+            .unwrap_or(self.key_section_start())
+    }
+
+    fn key_unchecked(&self, n: usize) -> &[u8] {
+        let start = self.key_start(n).unwrap_or(0);
+        let end = self.key_end(n).unwrap_or(start);
+        self.page.get(start..end).unwrap_or(&[])
+    }
+
+    pub(crate) fn entry(&self, n: usize) -> Option<EntryAccessor<'a>> {
+        // These offsets are read off the page, so a corrupt leaf can name a
+        // range that runs past its end, and indexing panicked on it:
+        //
+        //   range end index 1626 out of range for slice of length 1024
+        //
+        // `key_unchecked` immediately above already reads the same offsets
+        // through `get`; this is that guard at the sibling that lacked it.
+        // `entry_ranges` needs none: its callers build an `AccessGuard`,
+        // whose `value_checked` clamps against the page length.
+        //
+        // `None` means the same thing here as it already does for an
+        // out-of-bounds index -- no such entry -- and every caller handles it.
+        let key = self.page.get(self.key_start(n)?..self.key_end(n)?)?;
+        let value = self.page.get(self.value_start(n)?..self.value_end(n)?)?;
+        Some(EntryAccessor::new(key, value))
+    }
+
+    pub(crate) fn entry_ranges(&self, n: usize) -> Option<(Range<usize>, Range<usize>)> {
+        let key = self.key_start(n)?..self.key_end(n)?;
+        let value = self.value_start(n)?..self.value_end(n)?;
+        Some((key, value))
+    }
+
+    pub(super) fn last_entry(&self) -> Option<EntryAccessor<'a>> {
+        if self.num_pairs == 0 {
+            return None;
+        }
+        self.entry(self.num_pairs() - 1)
+    }
+}
+
+pub(super) struct LeafBuilder<'a, 'b> {
+    pairs: Vec<(&'a [u8], &'a [u8])>,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+    total_key_bytes: usize,
+    total_value_bytes: usize,
+    mem: &'b TransactionalMemory,
+    allocated_pages: &'b Mutex<PageTrackerPolicy>,
+}
+
+impl<'a, 'b> LeafBuilder<'a, 'b> {
+    pub(super) fn required_bytes(&self, num_pairs: usize, keys_values_bytes: usize) -> usize {
+        RawLeafBuilder::required_bytes(
+            num_pairs,
+            keys_values_bytes,
+            self.fixed_key_size,
+            self.fixed_value_size,
+        )
+    }
+
+    pub(super) fn new(
+        mem: &'b TransactionalMemory,
+        allocated_pages: &'b Mutex<PageTrackerPolicy>,
+        capacity: usize,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+    ) -> Self {
+        Self {
+            pairs: Vec::with_capacity(capacity),
+            fixed_key_size,
+            fixed_value_size,
+            total_key_bytes: 0,
+            total_value_bytes: 0,
+            mem,
+            allocated_pages,
+        }
+    }
+
+    pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
+        self.total_key_bytes += key.len();
+        self.total_value_bytes += value.len();
+        self.pairs.push((key, value));
+    }
+
+    /// Returns `Err` when an entry cannot be read.
+    ///
+    /// This used to return `()` and `unwrap` each entry. Skipping an
+    /// unreadable one instead would be worse than the panic: this copies a
+    /// leaf into a builder, so a dropped entry is silent data loss rather
+    /// than a visible failure.
+    pub(super) fn push_all_except(
+        &mut self,
+        accessor: &'a LeafAccessor<'_>,
+        except: Option<usize>,
+    ) -> Result<()> {
+        for i in 0..accessor.num_pairs() {
+            if let Some(except) = except
+                && except == i
+            {
+                continue;
+            }
+            let entry = accessor.entry(i).ok_or_else(|| {
+                StorageError::Corrupted(format!(
+                    "leaf entry {i} is unreadable: offsets name a range outside the page"
+                ))
+            })?;
+            self.push(entry.key(), entry.value());
+        }
+        Ok(())
+    }
+
+    pub(super) fn should_split(&self) -> bool {
+        let required_size = self.required_bytes(
+            self.pairs.len(),
+            self.total_key_bytes + self.total_value_bytes,
+        );
+        required_size > self.mem.get_page_size() && self.pairs.len() > 1
+    }
+
+    pub(super) fn build_split(self) -> Result<(PageMut, &'a [u8], PageMut)> {
+        let total_size = self.total_key_bytes + self.total_value_bytes;
+        let mut division = 0;
+        let mut first_split_key_bytes = 0;
+        let mut first_split_value_bytes = 0;
+        for (key, value) in self.pairs.iter().take(self.pairs.len() - 1) {
+            first_split_key_bytes += key.len();
+            first_split_value_bytes += value.len();
+            division += 1;
+            if first_split_key_bytes + first_split_value_bytes >= total_size / 2 {
+                break;
+            }
+        }
+
+        let required_size =
+            self.required_bytes(division, first_split_key_bytes + first_split_value_bytes);
+        let mut allocated_pages = self.allocated_pages.lock();
+        let mut page1 = self.mem.allocate(required_size, &mut allocated_pages)?;
+        let mut builder = RawLeafBuilder::new(
+            page1.memory_mut()?,
+            division,
+            self.fixed_key_size,
+            self.fixed_value_size,
+            first_split_key_bytes,
+        );
+        for (key, value) in self.pairs.iter().take(division) {
+            builder.append(key, value);
+        }
+        drop(builder);
+
+        let required_size = self.required_bytes(
+            self.pairs.len() - division,
+            self.total_key_bytes + self.total_value_bytes
+                - first_split_key_bytes
+                - first_split_value_bytes,
+        );
+        let mut page2 = self.mem.allocate(required_size, &mut allocated_pages)?;
+        let mut builder = RawLeafBuilder::new(
+            page2.memory_mut()?,
+            self.pairs.len() - division,
+            self.fixed_key_size,
+            self.fixed_value_size,
+            self.total_key_bytes - first_split_key_bytes,
+        );
+        for (key, value) in &self.pairs[division..] {
+            builder.append(key, value);
+        }
+        drop(builder);
+
+        Ok((page1, self.pairs[division - 1].0, page2))
+    }
+
+    pub(super) fn build(self) -> Result<PageMut> {
+        let required_size = self.required_bytes(
+            self.pairs.len(),
+            self.total_key_bytes + self.total_value_bytes,
+        );
+        let mut allocated_pages = self.allocated_pages.lock();
+        let mut page = self.mem.allocate(required_size, &mut allocated_pages)?;
+        let mut builder = RawLeafBuilder::new(
+            page.memory_mut()?,
+            self.pairs.len(),
+            self.fixed_key_size,
+            self.fixed_value_size,
+            self.total_key_bytes,
+        );
+        for (key, value) in self.pairs {
+            builder.append(key, value);
+        }
+        drop(builder);
+        Ok(page)
+    }
+}
+
+// Note the caller is responsible for ensuring that the buffer is large enough
+// and rewriting all fields if any dynamically sized fields are written
+// Layout is:
+// 1 byte: type
+// 1 byte: reserved (padding to 32bits aligned)
+// 2 bytes: num_entries (number of pairs)
+// (optional) repeating (num_entries times):
+// 4 bytes: key_end
+// (optional) repeating (num_entries times):
+// 4 bytes: value_end
+// repeating (num_entries times):
+// * n bytes: key data
+// repeating (num_entries times):
+// * n bytes: value data
+pub(crate) struct RawLeafBuilder<'a> {
+    page: &'a mut [u8],
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+    num_pairs: usize,
+    provisioned_key_bytes: usize,
+    pairs_written: usize, // used for debugging
+}
+
+impl<'a> RawLeafBuilder<'a> {
+    pub(crate) fn required_bytes(
+        num_pairs: usize,
+        keys_values_bytes: usize,
+        key_size: Option<usize>,
+        value_size: Option<usize>,
+    ) -> usize {
+        // Page id & header;
+        let mut result = 4;
+        // key & value lengths
+        if key_size.is_none() {
+            result += num_pairs * size_of::<u32>();
+        }
+        if value_size.is_none() {
+            result += num_pairs * size_of::<u32>();
+        }
+        result += keys_values_bytes;
+
+        result
+    }
+
+    pub(crate) fn new(
+        page: &'a mut [u8],
+        num_pairs: usize,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+        key_bytes: usize,
+    ) -> Self {
+        page[0] = LEAF;
+        page[2..4].copy_from_slice(&u16::try_from(num_pairs).unwrap().to_le_bytes());
+        #[cfg(debug_assertions)]
+        {
+            // Poison all the key & value offsets, in case the caller forgets to write them
+            let mut last = 4;
+            if fixed_key_size.is_none() {
+                last += size_of::<u32>() * num_pairs;
+            }
+            if fixed_value_size.is_none() {
+                last += size_of::<u32>() * num_pairs;
+            }
+            for x in &mut page[4..last] {
+                *x = 0xFF;
+            }
+        }
+        RawLeafBuilder {
+            page,
+            fixed_key_size,
+            fixed_value_size,
+            num_pairs,
+            provisioned_key_bytes: key_bytes,
+            pairs_written: 0,
+        }
+    }
+
+    fn value_end(&self, n: usize) -> usize {
+        if let Some(fixed) = self.fixed_value_size {
+            return self.key_section_start() + self.provisioned_key_bytes + fixed * (n + 1);
+        }
+        let mut offset = 4 + size_of::<u32>() * n;
+        if self.fixed_key_size.is_none() {
+            offset += size_of::<u32>() * self.num_pairs;
+        }
+        u32::from_le_bytes(
+            self.page[offset..(offset + size_of::<u32>())]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    fn key_section_start(&self) -> usize {
+        let mut offset = 4;
+        if self.fixed_key_size.is_none() {
+            offset += size_of::<u32>() * self.num_pairs;
+        }
+        if self.fixed_value_size.is_none() {
+            offset += size_of::<u32>() * self.num_pairs;
+        }
+
+        offset
+    }
+
+    fn key_end(&self, n: usize) -> usize {
+        if let Some(fixed) = self.fixed_key_size {
+            return self.key_section_start() + fixed * (n + 1);
+        }
+        let offset = 4 + size_of::<u32>() * n;
+        u32::from_le_bytes(
+            self.page[offset..(offset + size_of::<u32>())]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
+        if let Some(key_width) = self.fixed_key_size {
+            assert_eq!(key_width, key.len());
+        }
+        if let Some(value_width) = self.fixed_value_size {
+            assert_eq!(value_width, value.len());
+        }
+        let key_offset = if self.pairs_written == 0 {
+            self.key_section_start()
+        } else {
+            self.key_end(self.pairs_written - 1)
+        };
+        let value_offset = if self.pairs_written == 0 {
+            self.key_section_start() + self.provisioned_key_bytes
+        } else {
+            self.value_end(self.pairs_written - 1)
+        };
+
+        let n = self.pairs_written;
+        if self.fixed_key_size.is_none() {
+            let offset = 4 + size_of::<u32>() * n;
+            self.page[offset..(offset + size_of::<u32>())]
+                .copy_from_slice(&u32::try_from(key_offset + key.len()).unwrap().to_le_bytes());
+        }
+        self.page[key_offset..(key_offset + key.len())].copy_from_slice(key);
+        let written_key_len = key_offset + key.len() - self.key_section_start();
+        assert!(written_key_len <= self.provisioned_key_bytes);
+
+        if self.fixed_value_size.is_none() {
+            let mut offset = 4 + size_of::<u32>() * n;
+            if self.fixed_key_size.is_none() {
+                offset += size_of::<u32>() * self.num_pairs;
+            }
+            self.page[offset..(offset + size_of::<u32>())].copy_from_slice(
+                &u32::try_from(value_offset + value.len())
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+        }
+        self.page[value_offset..(value_offset + value.len())].copy_from_slice(value);
+        self.pairs_written += 1;
+    }
+}
+
+impl Drop for RawLeafBuilder<'_> {
+    fn drop(&mut self) {
+        let is_panicking = {
+            #[cfg(feature = "std")]
+            {
+                std::thread::panicking()
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                false
+            }
+        };
+        if !is_panicking {
+            assert_eq!(self.pairs_written, self.num_pairs);
+            if self.num_pairs > 0 {
+                assert_eq!(
+                    self.key_section_start() + self.provisioned_key_bytes,
+                    self.key_end(self.num_pairs - 1)
+                );
+            }
+        }
+    }
+}
+
+pub(crate) struct LeafMutator<'b> {
+    page: &'b mut [u8],
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+}
+
+impl<'b> LeafMutator<'b> {
+    pub(crate) fn new(
+        page: &'b mut [u8],
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+    ) -> Self {
+        debug_assert_eq!(page[0], LEAF);
+        Self {
+            page,
+            fixed_key_size,
+            fixed_value_size,
+        }
+    }
+
+    pub(super) fn sufficient_insert_inplace_space(
+        page: &'_ impl Page,
+        position: usize,
+        overwrite: bool,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+        new_key: &[u8],
+        new_value: &[u8],
+    ) -> bool {
+        let Ok(accessor) = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size)
+        else {
+            return false;
+        };
+        if overwrite {
+            let remaining = page.memory().len().saturating_sub(accessor.total_length());
+            let required_delta = isize::try_from(new_key.len() + new_value.len()).unwrap_or(0)
+                - isize::try_from(accessor.length_of_pairs(position, position + 1)).unwrap_or(0);
+            required_delta <= isize::try_from(remaining).unwrap_or(0)
+        } else {
+            // If this is a large page, only allow in-place appending to avoid write amplification
+            //
+            // Note: this check is also required to avoid inserting an unbounded number of small values
+            // into a large page, which could result in overflowing a u16 which is the maximum number of entries per leaf
+            if page.get_page_number().page_order > 0 && position < accessor.num_pairs() {
+                return false;
+            }
+            let remaining = page.memory().len().saturating_sub(accessor.total_length());
+            let mut required_delta = new_key.len() + new_value.len();
+            if fixed_key_size.is_none() {
+                required_delta += size_of::<u32>();
+            }
+            if fixed_value_size.is_none() {
+                required_delta += size_of::<u32>();
+            }
+            required_delta <= remaining
+        }
+    }
+
+    // Insert the given key, value pair at index i and shift all following pairs to the right
+    pub(crate) fn insert(
+        &mut self,
+        i: usize,
+        overwrite: bool,
+        key: &[u8],
+        value: &[u8],
+    ) -> crate::Result<()> {
+        let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size)?;
+        let required_delta = if overwrite {
+            isize::try_from(key.len() + value.len()).unwrap_or(0)
+                - isize::try_from(accessor.length_of_pairs(i, i + 1)).unwrap_or(0)
+        } else {
+            let mut delta = key.len() + value.len();
+            if self.fixed_key_size.is_none() {
+                delta += size_of::<u32>();
+            }
+            if self.fixed_value_size.is_none() {
+                delta += size_of::<u32>();
+            }
+            delta.try_into().unwrap_or(0)
+        };
+        debug_assert!(
+            isize::try_from(accessor.total_length()).unwrap_or(0) + required_delta
+                <= isize::try_from(self.page.len()).unwrap_or(0)
+        );
+
+        let num_pairs = accessor.num_pairs();
+        let last_key_end = accessor.key_end(num_pairs.saturating_sub(1)).unwrap_or(0);
+        let last_value_end = accessor.value_end(num_pairs.saturating_sub(1)).unwrap_or(0);
+        let shift_index = if overwrite { i + 1 } else { i };
+        let shift_key_start = accessor.key_start(shift_index).unwrap_or(last_key_end);
+        let shift_value_start = accessor.value_start(shift_index).unwrap_or(last_value_end);
+        let existing_value_len = accessor
+            .value_range(i)
+            .map(|(start, end)| end - start)
+            .unwrap_or_default();
+
+        let value_delta = if overwrite {
+            isize::try_from(value.len()).unwrap() - isize::try_from(existing_value_len).unwrap()
+        } else {
+            value.len().try_into().unwrap()
+        };
+
+        // Update all the pointers
+        let key_ptr_size: usize = if self.fixed_key_size.is_none() { 4 } else { 0 };
+        let value_ptr_size: usize = if self.fixed_value_size.is_none() {
+            4
+        } else {
+            0
+        };
+
+        // Every offset above is derived from the leaf's on-disk pointer arrays,
+        // and the three `copy_within` calls below assume they are ordered:
+        // key data precedes value data, and both precede the end of the last
+        // value. A corrupted leaf can break that, and `copy_within` panics on a
+        // reversed range rather than returning anything:
+        //
+        //     slice index starts at 4066 but ends at 1280
+        //
+        // Found by `fuzz_db_image` on input [255, 9, 225, 14], reached through
+        // the commit that `Database::drop` performs -- so a corrupt file could
+        // panic a process that was only closing the database. Check the chain
+        // once here instead of at each copy.
+        let pointer_end = 4 + key_ptr_size * num_pairs + value_ptr_size * i;
+        if pointer_end > shift_key_start
+            || shift_key_start > shift_value_start
+            || shift_value_start > last_value_end
+            || last_value_end > self.page.len()
+        {
+            return Err(StorageError::Corrupted(format!(
+                "Leaf page offsets are not ordered: pointers end {pointer_end}, key start                  {shift_key_start}, value start {shift_value_start}, last value end                  {last_value_end}, page length {}",
+                self.page.len()
+            )));
+        }
+
+        if !overwrite {
+            for j in 0..i {
+                self.update_key_end(j, (key_ptr_size + value_ptr_size).try_into().unwrap());
+                let value_delta: isize = (key_ptr_size + value_ptr_size + key.len())
+                    .try_into()
+                    .unwrap();
+                self.update_value_end(j, value_delta);
+            }
+        }
+        for j in i..num_pairs {
+            if overwrite {
+                self.update_value_end(j, value_delta);
+            } else {
+                let key_delta: isize = (key_ptr_size + value_ptr_size + key.len())
+                    .try_into()
+                    .unwrap();
+                self.update_key_end(j, key_delta);
+                let value_delta = key_delta + isize::try_from(value.len()).unwrap();
+                self.update_value_end(j, value_delta);
+            }
+        }
+
+        let new_num_pairs = if overwrite { num_pairs } else { num_pairs + 1 };
+        self.page[2..4].copy_from_slice(&u16::try_from(new_num_pairs).unwrap().to_le_bytes());
+
+        // Right shift the trailing values
+        let mut dest = if overwrite {
+            (isize::try_from(shift_value_start).unwrap() + value_delta)
+                .try_into()
+                .unwrap()
+        } else {
+            shift_value_start + key_ptr_size + value_ptr_size + key.len() + value.len()
+        };
+        let start = shift_value_start;
+        let end = last_value_end;
+        self.page.copy_within(start..end, dest);
+
+        // Insert the value
+        let inserted_value_end: u32 = dest.try_into().unwrap();
+        dest -= value.len();
+        self.page[dest..(dest + value.len())].copy_from_slice(value);
+
+        if !overwrite {
+            // Right shift the trailing key data & preceding value data
+            let start = shift_key_start;
+            let end = shift_value_start;
+            dest -= end - start;
+            self.page.copy_within(start..end, dest);
+
+            // Insert the key
+            let inserted_key_end: u32 = dest.try_into().unwrap();
+            dest -= key.len();
+            self.page[dest..(dest + key.len())].copy_from_slice(key);
+
+            // Right shift the trailing value pointers & preceding key data
+            let start = 4 + key_ptr_size * num_pairs + value_ptr_size * i;
+            let end = shift_key_start;
+            dest -= end - start;
+            debug_assert_eq!(
+                dest,
+                4 + key_ptr_size * new_num_pairs + value_ptr_size * (i + 1)
+            );
+            self.page.copy_within(start..end, dest);
+
+            // Insert the value pointer
+            if self.fixed_value_size.is_none() {
+                dest -= size_of::<u32>();
+                self.page[dest..(dest + size_of::<u32>())]
+                    .copy_from_slice(&inserted_value_end.to_le_bytes());
+            }
+
+            // Right shift the trailing key pointers & preceding value pointers
+            let start = 4 + key_ptr_size * i;
+            let end = 4 + key_ptr_size * num_pairs + value_ptr_size * i;
+            dest -= end - start;
+            debug_assert_eq!(dest, 4 + key_ptr_size * (i + 1));
+            self.page.copy_within(start..end, dest);
+
+            // Insert the key pointer
+            if self.fixed_key_size.is_none() {
+                dest -= size_of::<u32>();
+                self.page[dest..(dest + size_of::<u32>())]
+                    .copy_from_slice(&inserted_key_end.to_le_bytes());
+            }
+            debug_assert_eq!(dest, 4 + key_ptr_size * i);
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove(&mut self, i: usize) -> crate::Result<()> {
+        let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size)?;
+        let num_pairs = accessor.num_pairs();
+        if i >= num_pairs {
+            return Err(StorageError::corrupted(format!(
+                "LeafMutator::remove index {i} out of range (num_pairs={num_pairs})"
+            )));
+        }
+        if num_pairs <= 1 {
+            return Err(StorageError::corrupted(format!(
+                "LeafMutator::remove on leaf with only {num_pairs} pair(s)"
+            )));
+        }
+        let corrupt = |msg: &str| StorageError::corrupted(format!("LeafMutator::remove: {msg}"));
+        let key_start = accessor
+            .key_start(i)
+            .ok_or_else(|| corrupt("missing key_start"))?;
+        let key_end = accessor
+            .key_end(i)
+            .ok_or_else(|| corrupt("missing key_end"))?;
+        let value_start = accessor
+            .value_start(i)
+            .ok_or_else(|| corrupt("missing value_start"))?;
+        let value_end = accessor
+            .value_end(i)
+            .ok_or_else(|| corrupt("missing value_end"))?;
+        let last_value_end = accessor
+            .value_end(num_pairs - 1)
+            .ok_or_else(|| corrupt("missing last value_end"))?;
+
+        // Update all the pointers
+        let key_ptr_size = if self.fixed_key_size.is_none() {
+            size_of::<u32>()
+        } else {
+            0
+        };
+        let value_ptr_size = if self.fixed_value_size.is_none() {
+            size_of::<u32>()
+        } else {
+            0
+        };
+        for j in 0..i {
+            self.update_key_end(j, -isize::try_from(key_ptr_size + value_ptr_size).unwrap());
+            let value_delta = -isize::try_from(key_ptr_size + value_ptr_size).unwrap()
+                - isize::try_from(key_end - key_start).unwrap();
+            self.update_value_end(j, value_delta);
+        }
+        for j in (i + 1)..num_pairs {
+            let key_delta = -isize::try_from(key_ptr_size + value_ptr_size).unwrap()
+                - isize::try_from(key_end - key_start).unwrap();
+            self.update_key_end(j, key_delta);
+            let value_delta = key_delta - isize::try_from(value_end - value_start).unwrap();
+            self.update_value_end(j, value_delta);
+        }
+
+        // Left shift all the pointers & data
+
+        let new_num_pairs = num_pairs - 1;
+        self.page[2..4].copy_from_slice(&u16::try_from(new_num_pairs).unwrap().to_le_bytes());
+        // Left shift the trailing key pointers & preceding value pointers
+        let mut dest = 4 + key_ptr_size * i;
+        // First trailing key pointer
+        let start = 4 + key_ptr_size * (i + 1);
+        // Last preceding value pointer
+        let end = 4 + key_ptr_size * num_pairs + value_ptr_size * i;
+        self.page.copy_within(start..end, dest);
+        dest += end - start;
+        debug_assert_eq!(dest, 4 + key_ptr_size * new_num_pairs + value_ptr_size * i);
+
+        // Left shift the trailing value pointers & preceding key data
+        let start = 4 + key_ptr_size * num_pairs + value_ptr_size * (i + 1);
+        let end = key_start;
+        self.page.copy_within(start..end, dest);
+        dest += end - start;
+
+        let preceding_key_len = key_start - (4 + (key_ptr_size + value_ptr_size) * num_pairs);
+        debug_assert_eq!(
+            dest,
+            4 + (key_ptr_size + value_ptr_size) * new_num_pairs + preceding_key_len
+        );
+
+        // Left shift the trailing key data & preceding value data
+        let start = key_end;
+        let end = value_start;
+        self.page.copy_within(start..end, dest);
+        dest += end - start;
+
+        // Left shift the trailing value data
+        let preceding_data_len =
+            value_start - (4 + (key_ptr_size + value_ptr_size) * num_pairs) - (key_end - key_start);
+        debug_assert_eq!(
+            dest,
+            4 + (key_ptr_size + value_ptr_size) * new_num_pairs + preceding_data_len
+        );
+        let start = value_end;
+        let end = last_value_end;
+        self.page.copy_within(start..end, dest);
+        Ok(())
+    }
+
+    fn update_key_end(&mut self, i: usize, delta: isize) {
+        if self.fixed_key_size.is_some() {
+            return;
+        }
+        let offset = 4 + size_of::<u32>() * i;
+        if let Some(slice) = self.page.get(offset..offset + size_of::<u32>()) {
+            let mut ptr = u32::from_le_bytes(slice.try_into().unwrap());
+            let new_val = isize::try_from(ptr).unwrap_or(0) + delta;
+            ptr = new_val.try_into().unwrap_or(0);
+            self.page[offset..(offset + size_of::<u32>())].copy_from_slice(&ptr.to_le_bytes());
+        }
+    }
+
+    fn update_value_end(&mut self, i: usize, delta: isize) {
+        if self.fixed_value_size.is_some() {
+            return;
+        }
+        let num_pairs =
+            match LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size) {
+                Ok(a) => a.num_pairs(),
+                Err(_) => return,
+            };
+        let mut offset = 4 + size_of::<u32>() * i;
+        if self.fixed_key_size.is_none() {
+            offset += size_of::<u32>() * num_pairs;
+        }
+        if let Some(slice) = self.page.get(offset..offset + size_of::<u32>()) {
+            let mut ptr = u32::from_le_bytes(slice.try_into().unwrap());
+            let new_val = isize::try_from(ptr).unwrap_or(0) + delta;
+            ptr = new_val.try_into().unwrap_or(0);
+            self.page[offset..(offset + size_of::<u32>())].copy_from_slice(&ptr.to_le_bytes());
+        }
+    }
+}
+
+// Provides a simple zero-copy way to access a branch page
+// Visibility: pub(crate) is required because multimap_table.rs (outside
+// tree_store module) needs direct access to BranchAccessor.
+pub(crate) struct BranchAccessor<'a: 'b, 'b, T: Page + 'a> {
+    page: &'b T,
+    num_keys: usize,
+    fixed_key_size: Option<usize>,
+    _page_lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
+    pub(crate) fn new(
+        page: &'b T,
+        fixed_key_size: Option<usize>,
+    ) -> core::result::Result<Self, StorageError> {
+        let mem = page.memory();
+        if mem.len() < 8 {
+            return Err(StorageError::Corrupted(
+                "Branch page too small for header".into(),
+            ));
+        }
+        debug_assert_eq!(mem[0], BRANCH);
+        let num_keys = u16::from_le_bytes(
+            mem[2..4]
+                .try_into()
+                .map_err(|_| StorageError::Corrupted("Branch page: bad num_keys".into()))?,
+        ) as usize;
+        let num_children = num_keys + 1;
+        let child_table_size =
+            (PageNumber::serialized_size() + size_of::<Checksum>()) * num_children;
+        let mut min_size = 8usize.saturating_add(child_table_size);
+        if fixed_key_size.is_none() {
+            min_size = min_size.saturating_add(size_of::<u32>().saturating_mul(num_keys));
+        }
+        if min_size > mem.len() {
+            return Err(StorageError::Corrupted(format!(
+                "Branch page: num_keys={num_keys} requires {min_size}B for headers, page is {}B",
+                mem.len()
+            )));
+        }
+        Ok(BranchAccessor {
+            page,
+            num_keys,
+            fixed_key_size,
+            _page_lifetime: Default::default(),
+        })
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn print_node<K: Key>(&self) {
+        eprint!(
+            "Internal[ (page={:?}), child_0={:?}",
+            self.page.get_page_number(),
+            self.child_page(0).unwrap()
+        );
+        for i in 0..(self.count_children() - 1) {
+            if let Some(child) = self.child_page(i + 1) {
+                let key = self.key(i).unwrap();
+                eprint!(" key_{i}={:?}", K::from_bytes(key));
+                eprint!(" child_{}={child:?}", i + 1);
+            }
+        }
+        eprint!("]");
+    }
+
+    pub(crate) fn total_length(&self) -> usize {
+        if self.num_keys == 0 {
+            return self.key_section_start();
+        }
+        // Keys are stored at the end
+        self.key_end(self.num_keys() - 1)
+            .unwrap_or(self.key_section_start())
+    }
+
+    pub(super) fn child_for_key<K: Key>(
+        &self,
+        query: &[u8],
+    ) -> core::result::Result<(usize, PageNumber), StorageError> {
+        let mut min_child = 0; // inclusive
+        let mut max_child = self.num_keys(); // inclusive
+        while min_child < max_child {
+            let mid = min_child.midpoint(max_child);
+            let key = self.key(mid).ok_or_else(|| {
+                StorageError::Corrupted(format!("Branch: missing key at index {mid}"))
+            })?;
+            match K::compare(query, key) {
+                Ordering::Less => {
+                    max_child = mid;
+                }
+                Ordering::Equal => {
+                    let page = self.child_page(mid).ok_or_else(|| {
+                        StorageError::Corrupted(format!("Branch: missing child at index {mid}"))
+                    })?;
+                    return Ok((mid, page));
+                }
+                Ordering::Greater => {
+                    min_child = mid + 1;
+                }
+            }
+        }
+        debug_assert_eq!(min_child, max_child);
+
+        let page = self.child_page(min_child).ok_or_else(|| {
+            StorageError::Corrupted(format!("Branch: missing child at index {min_child}"))
+        })?;
+        Ok((min_child, page))
+    }
+
+    fn key_section_start(&self) -> usize {
+        if self.fixed_key_size.is_none() {
+            8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children()
+                + size_of::<u32>() * self.num_keys()
+        } else {
+            8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children()
+        }
+    }
+
+    fn key_offset(&self, n: usize) -> usize {
+        if n == 0 {
+            self.key_section_start()
+        } else {
+            self.key_end(n - 1).unwrap()
+        }
+    }
+
+    fn key_end(&self, n: usize) -> Option<usize> {
+        if let Some(fixed) = self.fixed_key_size {
+            return Some(self.key_section_start() + fixed * (n + 1));
+        }
+        let offset = 8
+            + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children()
+            + size_of::<u32>() * n;
+        Some(u32::from_le_bytes(
+            self.page
+                .memory()
+                .get(offset..(offset + size_of::<u32>()))?
+                .try_into()
+                .ok()?,
+        ) as usize)
+    }
+
+    pub(super) fn key(&self, n: usize) -> Option<&[u8]> {
+        if n >= self.num_keys() {
+            return None;
+        }
+        let offset = self.key_offset(n);
+        let end = self.key_end(n)?;
+        // Both bounds come from on-disk offsets, so the range can be reversed
+        // or past the page: "range start index 1728053248 out of range for
+        // slice of length 4096". This already returns Option, so `get` reports
+        // it the same way an absent key is reported.
+        self.page.memory().get(offset..end)
+    }
+
+    pub(crate) fn count_children(&self) -> usize {
+        self.num_keys() + 1
+    }
+
+    pub(crate) fn child_checksum(&self, n: usize) -> Option<Checksum> {
+        if n >= self.count_children() {
+            return None;
+        }
+
+        let offset = 8 + size_of::<Checksum>() * n;
+        Some(Checksum::from_le_bytes(
+            self.page
+                .memory()
+                .get(offset..(offset + size_of::<Checksum>()))?
+                .try_into()
+                .ok()?,
+        ))
+    }
+
+    pub(crate) fn child_page(&self, n: usize) -> Option<PageNumber> {
+        if n >= self.count_children() {
+            return None;
+        }
+
+        let offset =
+            8 + size_of::<Checksum>() * self.count_children() + PageNumber::serialized_size() * n;
+        Some(PageNumber::from_le_bytes(
+            self.page
+                .memory()
+                .get(offset..(offset + PageNumber::serialized_size()))?
+                .try_into()
+                .ok()?,
+        ))
+    }
+
+    fn num_keys(&self) -> usize {
+        self.num_keys
+    }
+}
+
+pub(super) struct BranchBuilder<'a, 'b> {
+    children: Vec<(PageNumber, Checksum)>,
+    keys: Vec<&'a [u8]>,
+    total_key_bytes: usize,
+    fixed_key_size: Option<usize>,
+    mem: &'b TransactionalMemory,
+    allocated_pages: &'b Mutex<PageTrackerPolicy>,
+}
+
+impl<'a, 'b> BranchBuilder<'a, 'b> {
+    pub(super) fn new(
+        mem: &'b TransactionalMemory,
+        allocated_pages: &'b Mutex<PageTrackerPolicy>,
+        child_capacity: usize,
+        fixed_key_size: Option<usize>,
+    ) -> Self {
+        Self {
+            children: Vec::with_capacity(child_capacity),
+            keys: Vec::with_capacity(child_capacity - 1),
+            total_key_bytes: 0,
+            fixed_key_size,
+            mem,
+            allocated_pages,
+        }
+    }
+
+    pub(super) fn replace_child(&mut self, index: usize, child: PageNumber, checksum: Checksum) {
+        self.children[index] = (child, checksum);
+    }
+
+    pub(super) fn push_child(&mut self, child: PageNumber, checksum: Checksum) {
+        self.children.push((child, checksum));
+    }
+
+    pub(super) fn push_key(&mut self, key: &'a [u8]) {
+        self.keys.push(key);
+        self.total_key_bytes += key.len();
+    }
+
+    pub(super) fn push_all<T: Page>(&mut self, accessor: &'a BranchAccessor<'_, '_, T>) {
+        for i in 0..accessor.count_children() {
+            let child = accessor.child_page(i).unwrap();
+            let checksum = accessor.child_checksum(i).unwrap();
+            self.push_child(child, checksum);
+        }
+        for i in 0..(accessor.count_children() - 1) {
+            self.push_key(accessor.key(i).unwrap());
+        }
+    }
+
+    pub(super) fn to_single_child(&self) -> Option<(PageNumber, Checksum)> {
+        if self.children.len() > 1 {
+            None
+        } else {
+            Some(self.children[0])
+        }
+    }
+
+    pub(super) fn build(self) -> Result<PageMut> {
+        assert_eq!(self.children.len(), self.keys.len() + 1);
+        let size = RawBranchBuilder::required_bytes(
+            self.keys.len(),
+            self.total_key_bytes,
+            self.fixed_key_size,
+        );
+        let mut allocated_pages = self.allocated_pages.lock();
+        let mut page = self.mem.allocate(size, &mut allocated_pages)?;
+        let mut builder =
+            RawBranchBuilder::new(page.memory_mut()?, self.keys.len(), self.fixed_key_size);
+        builder.write_first_page(self.children[0].0, self.children[0].1);
+        for i in 1..self.children.len() {
+            let key = &self.keys[i - 1];
+            builder.write_nth_key(key.as_ref(), self.children[i].0, self.children[i].1, i - 1);
+        }
+        drop(builder);
+
+        Ok(page)
+    }
+
+    pub(super) fn should_split(&self) -> bool {
+        let size = RawBranchBuilder::required_bytes(
+            self.keys.len(),
+            self.total_key_bytes,
+            self.fixed_key_size,
+        );
+        size > self.mem.get_page_size() && self.keys.len() >= 3
+    }
+
+    pub(super) fn build_split(self) -> Result<(PageMut, &'a [u8], PageMut)> {
+        let mut allocated_pages = self.allocated_pages.lock();
+        assert_eq!(self.children.len(), self.keys.len() + 1);
+        assert!(self.keys.len() >= 3);
+        let division = self.keys.len() / 2;
+        let first_split_key_len: usize = self.keys.iter().take(division).map(|k| k.len()).sum();
+        let division_key = self.keys[division];
+        let second_split_key_len = self.total_key_bytes - first_split_key_len - division_key.len();
+
+        let size =
+            RawBranchBuilder::required_bytes(division, first_split_key_len, self.fixed_key_size);
+        let mut page1 = self.mem.allocate(size, &mut allocated_pages)?;
+        let mut builder = RawBranchBuilder::new(page1.memory_mut()?, division, self.fixed_key_size);
+        builder.write_first_page(self.children[0].0, self.children[0].1);
+        for i in 0..division {
+            let key = &self.keys[i];
+            builder.write_nth_key(
+                key.as_ref(),
+                self.children[i + 1].0,
+                self.children[i + 1].1,
+                i,
+            );
+        }
+        drop(builder);
+
+        let size = RawBranchBuilder::required_bytes(
+            self.keys.len() - division - 1,
+            second_split_key_len,
+            self.fixed_key_size,
+        );
+        let mut page2 = self.mem.allocate(size, &mut allocated_pages)?;
+        let mut builder = RawBranchBuilder::new(
+            page2.memory_mut()?,
+            self.keys.len() - division - 1,
+            self.fixed_key_size,
+        );
+        builder.write_first_page(self.children[division + 1].0, self.children[division + 1].1);
+        for i in (division + 1)..self.keys.len() {
+            let key = &self.keys[i];
+            builder.write_nth_key(
+                key.as_ref(),
+                self.children[i + 1].0,
+                self.children[i + 1].1,
+                i - division - 1,
+            );
+        }
+        drop(builder);
+
+        Ok((page1, division_key, page2))
+    }
+}
+
+// Note the caller is responsible for ensuring that the buffer is large enough
+// and rewriting all fields if any dynamically sized fields are written
+// Layout is:
+// 1 byte: type
+// 1 byte: padding (padding to 16bits aligned)
+// 2 bytes: num_keys (number of keys)
+// 4 byte: padding (padding to 64bits aligned)
+// repeating (num_keys + 1 times):
+// 16 bytes: child page checksum
+// repeating (num_keys + 1 times):
+// 8 bytes: page number
+// (optional) repeating (num_keys times):
+// * 4 bytes: key end. Ending offset of the key, exclusive
+// repeating (num_keys times):
+// * n bytes: key data
+pub(super) struct RawBranchBuilder<'b> {
+    page: &'b mut [u8],
+    fixed_key_size: Option<usize>,
+    num_keys: usize,
+    keys_written: usize, // used for debugging
+}
+
+impl<'b> RawBranchBuilder<'b> {
+    pub(super) fn required_bytes(
+        num_keys: usize,
+        size_of_keys: usize,
+        fixed_key_size: Option<usize>,
+    ) -> usize {
+        if fixed_key_size.is_none() {
+            let fixed_size = 8
+                + (PageNumber::serialized_size() + size_of::<Checksum>()) * (num_keys + 1)
+                + size_of::<u32>() * num_keys;
+            size_of_keys + fixed_size
+        } else {
+            let fixed_size =
+                8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * (num_keys + 1);
+            size_of_keys + fixed_size
+        }
+    }
+
+    // Caller MUST write num_keys values
+    pub(super) fn new(page: &'b mut [u8], num_keys: usize, fixed_key_size: Option<usize>) -> Self {
+        assert!(num_keys > 0);
+        page[0] = BRANCH;
+        page[2..4].copy_from_slice(&u16::try_from(num_keys).unwrap().to_le_bytes());
+        #[cfg(debug_assertions)]
+        {
+            // Poison all the child pointers & key offsets, in case the caller forgets to write them
+            let start = 8 + size_of::<Checksum>() * (num_keys + 1);
+            let mut last =
+                8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * (num_keys + 1);
+            if fixed_key_size.is_none() {
+                last += size_of::<u32>() * num_keys;
+            }
+            for x in &mut page[start..last] {
+                *x = 0xFF;
+            }
+        }
+        RawBranchBuilder {
+            page,
+            fixed_key_size,
+            num_keys,
+            keys_written: 0,
+        }
+    }
+
+    pub(super) fn write_first_page(&mut self, page_number: PageNumber, checksum: Checksum) {
+        let offset = 8;
+        self.page[offset..(offset + size_of::<Checksum>())]
+            .copy_from_slice(&checksum.to_le_bytes());
+        let offset = 8 + size_of::<Checksum>() * (self.num_keys + 1);
+        self.page[offset..(offset + PageNumber::serialized_size())]
+            .copy_from_slice(&page_number.to_le_bytes());
+    }
+
+    fn key_section_start(&self) -> usize {
+        let mut offset =
+            8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1);
+        if self.fixed_key_size.is_none() {
+            offset += size_of::<u32>() * self.num_keys;
+        }
+
+        offset
+    }
+
+    fn key_end(&self, n: usize) -> usize {
+        if let Some(fixed) = self.fixed_key_size {
+            return self.key_section_start() + fixed * (n + 1);
+        }
+        let offset = 8
+            + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1)
+            + size_of::<u32>() * n;
+        u32::from_le_bytes(
+            self.page[offset..(offset + size_of::<u32>())]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    // Write the nth key and page of values greater than this key, but less than or equal to the next
+    // Caller must write keys & pages in increasing order
+    pub(super) fn write_nth_key(
+        &mut self,
+        key: &[u8],
+        page_number: PageNumber,
+        checksum: Checksum,
+        n: usize,
+    ) {
+        assert!(n < self.num_keys);
+        assert_eq!(n, self.keys_written);
+        self.keys_written += 1;
+        let offset = 8 + size_of::<Checksum>() * (n + 1);
+        self.page[offset..(offset + size_of::<Checksum>())]
+            .copy_from_slice(&checksum.to_le_bytes());
+        let offset = 8
+            + size_of::<Checksum>() * (self.num_keys + 1)
+            + PageNumber::serialized_size() * (n + 1);
+        self.page[offset..(offset + PageNumber::serialized_size())]
+            .copy_from_slice(&page_number.to_le_bytes());
+
+        let data_offset = if n > 0 {
+            self.key_end(n - 1)
+        } else {
+            self.key_section_start()
+        };
+        if self.fixed_key_size.is_none() {
+            let offset = 8
+                + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1)
+                + size_of::<u32>() * n;
+            self.page[offset..(offset + size_of::<u32>())].copy_from_slice(
+                &u32::try_from(data_offset + key.len())
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+        }
+
+        debug_assert!(data_offset > offset);
+        self.page[data_offset..(data_offset + key.len())].copy_from_slice(key);
+    }
+}
+
+impl Drop for RawBranchBuilder<'_> {
+    fn drop(&mut self) {
+        let is_panicking = {
+            #[cfg(feature = "std")]
+            {
+                std::thread::panicking()
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                false
+            }
+        };
+        if !is_panicking {
+            assert_eq!(self.keys_written, self.num_keys);
+        }
+    }
+}
+
+pub(crate) struct BranchMutator<'b> {
+    page: &'b mut [u8],
+}
+
+impl<'b> BranchMutator<'b> {
+    pub(crate) fn new(page: &'b mut [u8]) -> Self {
+        debug_assert_eq!(page[0], BRANCH);
+        Self { page }
+    }
+
+    fn num_keys(&self) -> usize {
+        u16::from_le_bytes(self.page[2..4].try_into().unwrap()) as usize
+    }
+
+    pub(crate) fn write_child_page(
+        &mut self,
+        i: usize,
+        page_number: PageNumber,
+        checksum: Checksum,
+    ) {
+        debug_assert!(i <= self.num_keys());
+        let offset = 8 + size_of::<Checksum>() * i;
+        self.page[offset..(offset + size_of::<Checksum>())]
+            .copy_from_slice(&checksum.to_le_bytes());
+        let offset =
+            8 + size_of::<Checksum>() * (self.num_keys() + 1) + PageNumber::serialized_size() * i;
+        self.page[offset..(offset + PageNumber::serialized_size())]
+            .copy_from_slice(&page_number.to_le_bytes());
+    }
+}

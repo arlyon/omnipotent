@@ -1,0 +1,503 @@
+use alloc::format;
+use alloc::vec::Vec;
+use core::fmt::{self, Debug};
+
+use crate::types::{MutInPlaceValue, TypeName, Value};
+
+/// Fixed-dimension vector type for storing embeddings and feature vectors.
+///
+/// `FixedVec<N>` stores exactly `N` contiguous little-endian `f32` values with no
+/// length header, giving `fixed_width() = Some(N * 4)` for optimal B-tree page layout.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use shodh_redb::{Database, TableDefinition, FixedVec, ReadableTable};
+///
+/// const EMBEDDINGS: TableDefinition<u64, FixedVec<384>> = TableDefinition::new("embeddings");
+///
+/// let db = Database::create("vectors.redb")?;
+/// let write_txn = db.begin_write()?;
+/// {
+///     let mut table = write_txn.open_table(EMBEDDINGS)?;
+///     let embedding: [f32; 384] = compute_embedding();
+///     table.insert(&1u64, &embedding)?;
+/// }
+/// write_txn.commit()?;
+/// ```
+pub struct FixedVec<const N: usize>;
+
+impl<const N: usize> Debug for FixedVec<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FixedVec<{N}>")
+    }
+}
+
+impl<const N: usize> Value for FixedVec<N> {
+    type SelfType<'a>
+        = [f32; N]
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = Vec<u8>
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(N * core::mem::size_of::<f32>())
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> [f32; N]
+    where
+        Self: 'a,
+    {
+        let expected = N * core::mem::size_of::<f32>();
+        // Clamp to available bytes, zero-padding a short buffer, so corrupt
+        // or dimension-mismatched data degrades instead of panicking. The
+        // result is a degraded vector; the database stays operational.
+        //
+        // A debug_assert! on `data.len() >= expected` used to sit here,
+        // firing on exactly the input the lines below exist to tolerate.
+        // `Value::from_bytes` cannot return an error and this length comes
+        // off disk, so degrading IS the contract; an assertion contradicting
+        // it only turns a handled case into a crash in debug and fuzz
+        // builds. That is how fuzz_quantization failed the first time it
+        // was ever run.
+        let usable = data.len().min(expected);
+        let mut result = [0.0f32; N];
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: On little-endian targets, f32 byte representation matches
+            // memory layout. `usable` <= data.len() and usable <= N*4, so both
+            // source and dest have sufficient bytes. Pointers are non-overlapping.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    result.as_mut_ptr().cast::<u8>(),
+                    usable,
+                );
+            }
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let full_floats = usable / 4;
+            for i in 0..full_floats {
+                let start = i * 4;
+                result[i] = f32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]);
+            }
+        }
+        result
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a [f32; N]) -> Vec<u8>
+    where
+        Self: 'b,
+    {
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: On little-endian targets, the f32 slice memory is already
+            // in LE byte order. We create a byte view and copy to a Vec.
+            let byte_slice =
+                unsafe { core::slice::from_raw_parts(value.as_ptr().cast::<u8>(), N * 4) };
+            byte_slice.to_vec()
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut result = Vec::with_capacity(N * core::mem::size_of::<f32>());
+            for val in value {
+                result.extend_from_slice(&val.to_le_bytes());
+            }
+            result
+        }
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal(&format!("redb::vec::FixedVec<{N}>"))
+    }
+}
+
+impl<const N: usize> MutInPlaceValue for FixedVec<N> {
+    type BaseRefType = [u8];
+
+    fn initialize(data: &mut [u8]) {
+        data.fill(0);
+    }
+
+    fn from_bytes_mut(data: &mut [u8]) -> &mut [u8] {
+        data
+    }
+}
+
+/// Dynamic-dimension vector type for storing variable-length vectors.
+///
+/// `DynVec` stores contiguous little-endian `f32` values with the dimension
+/// inferred from the byte length (`dim = data.len() / 4`). This is useful when
+/// different rows may have different vector dimensions.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use shodh_redb::{Database, TableDefinition, DynVec, ReadableTable};
+///
+/// const VECTORS: TableDefinition<u64, DynVec> = TableDefinition::new("vectors");
+///
+/// let db = Database::create("dynamic.redb")?;
+/// let write_txn = db.begin_write()?;
+/// {
+///     let mut table = write_txn.open_table(VECTORS)?;
+///     let vec3: Vec<f32> = vec![1.0, 2.0, 3.0];
+///     table.insert(&1u64, &vec3)?;
+/// }
+/// write_txn.commit()?;
+/// ```
+pub struct DynVec;
+
+impl Debug for DynVec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DynVec")
+    }
+}
+
+impl Value for DynVec {
+    type SelfType<'a>
+        = Vec<f32>
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = Vec<u8>
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Vec<f32>
+    where
+        Self: 'a,
+    {
+        // Truncate to a multiple of 4 bytes to avoid partial reads
+        let usable = data.len() - (data.len() % 4);
+        let dim = usable / 4;
+        #[cfg(target_endian = "little")]
+        {
+            let mut result = alloc::vec![0.0f32; dim];
+            // SAFETY: On LE targets, f32 byte representation matches memory layout.
+            // Source has `usable` bytes (dim * 4), dest has dim f32s (dim * 4 bytes).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    result.as_mut_ptr().cast::<u8>(),
+                    dim * 4,
+                );
+            }
+            result
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut result = Vec::with_capacity(dim);
+            for i in 0..dim {
+                let start = i * 4;
+                let bytes: [u8; 4] = [
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ];
+                result.push(f32::from_le_bytes(bytes));
+            }
+            result
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Vec<f32>) -> Vec<u8>
+    where
+        Self: 'b,
+    {
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: On LE targets, the f32 slice memory is already in LE byte order.
+            let byte_slice = unsafe {
+                core::slice::from_raw_parts(value.as_ptr().cast::<u8>(), value.len() * 4)
+            };
+            byte_slice.to_vec()
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut result = Vec::with_capacity(value.len() * core::mem::size_of::<f32>());
+            for val in value {
+                result.extend_from_slice(&val.to_le_bytes());
+            }
+            result
+        }
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal("redb::vec::DynVec")
+    }
+}
+
+/// Binary quantized vector type for ultra-compact storage.
+///
+/// `BinaryQuantized<N>` stores `N` bytes representing `N * 8` binary dimensions.
+/// Each bit encodes whether the corresponding f32 dimension was positive (1) or
+/// negative/zero (0). This gives 32x compression over full f32 vectors.
+///
+/// Use [`quantize_binary`] to convert f32 vectors to binary, and
+/// [`hamming_distance`](crate::hamming_distance) to compare.
+///
+/// # Storage layout
+///
+/// `fixed_width() = Some(N)` -- exactly `N` bytes, no header.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use shodh_redb::{Database, TableDefinition, BinaryQuantized};
+/// use shodh_redb::vector_ops::quantize_binary;
+///
+/// // 384 f32 dims -> 48 bytes (384/8)
+/// const BQ_TABLE: TableDefinition<u64, BinaryQuantized<48>> = TableDefinition::new("bq_emb");
+///
+/// let embedding: [f32; 384] = compute_embedding();
+/// let binary = quantize_binary(&embedding); // Vec<u8>, len=48
+/// let bytes: [u8; 48] = binary.try_into().unwrap();
+/// table.insert(&1u64, &bytes)?;
+/// ```
+pub struct BinaryQuantized<const N: usize>;
+
+impl<const N: usize> Debug for BinaryQuantized<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BinaryQuantized<{N}>")
+    }
+}
+
+impl<const N: usize> Value for BinaryQuantized<N> {
+    type SelfType<'a>
+        = [u8; N]
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = [u8; N]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(N)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> [u8; N]
+    where
+        Self: 'a,
+    {
+        if let Ok(arr) = data.try_into() {
+            arr
+        } else {
+            // Corrupted data: copy what we have and zero-pad the rest
+            let mut result = [0u8; N];
+            let copy_len = data.len().min(N);
+            result[..copy_len].copy_from_slice(&data[..copy_len]);
+            result
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a [u8; N]) -> [u8; N]
+    where
+        Self: 'b,
+    {
+        *value
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal(&format!("redb::vec::BinaryQuantized<{N}>"))
+    }
+}
+
+impl<const N: usize> MutInPlaceValue for BinaryQuantized<N> {
+    type BaseRefType = [u8];
+
+    fn initialize(data: &mut [u8]) {
+        data.fill(0);
+    }
+
+    fn from_bytes_mut(data: &mut [u8]) -> &mut [u8] {
+        data
+    }
+}
+
+/// Scalar quantized vector with per-vector min/max scale factors.
+///
+/// `ScalarQuantized<N>` stores `N` dimensions as `u8` values (0..255) plus two
+/// `f32` scale factors (`min_val`, `max_val`), giving approximately 4x compression
+/// over full f32 storage with bounded quantization error.
+///
+/// # Storage layout
+///
+/// ```text
+/// [min_val: f32 LE][max_val: f32 LE][q0: u8][q1: u8]...[q_{N-1}: u8]
+/// ```
+///
+/// `fixed_width() = Some(8 + N)` -- 8 bytes header + N quantized values.
+///
+/// # Quantization formula
+///
+/// Encode: `q_i = round(255 * (x_i - min) / (max - min))`
+/// Decode: `x_i = min + q_i * (max - min) / 255`
+///
+/// Use [`quantize_scalar`] and [`dequantize_scalar`] for conversion.
+pub struct ScalarQuantized<const N: usize>;
+
+impl<const N: usize> Debug for ScalarQuantized<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ScalarQuantized<{N}>")
+    }
+}
+
+/// Header size for scalar quantized vectors: `min_val` (4 bytes) + `max_val` (4 bytes).
+const SQ_HEADER: usize = 8;
+
+impl<const N: usize> Value for ScalarQuantized<N> {
+    type SelfType<'a>
+        = SQVec<N>
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = Vec<u8>
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(SQ_HEADER + N)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> SQVec<N>
+    where
+        Self: 'a,
+    {
+        if data.len() < SQ_HEADER + N {
+            return SQVec {
+                min_val: 0.0,
+                max_val: 0.0,
+                codes: [0u8; N],
+            };
+        }
+        let min_val = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let max_val = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        // Reject NaN/Inf scale factors from corrupted pages -- dequantizing
+        // with non-finite bounds produces garbage values that silently
+        // corrupt all downstream distance computations.
+        if !min_val.is_finite() || !max_val.is_finite() {
+            return SQVec {
+                min_val: 0.0,
+                max_val: 0.0,
+                codes: [0u8; N],
+            };
+        }
+        let mut codes = [0u8; N];
+        codes.copy_from_slice(&data[SQ_HEADER..SQ_HEADER + N]);
+        SQVec {
+            min_val,
+            max_val,
+            codes,
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a SQVec<N>) -> Vec<u8>
+    where
+        Self: 'b,
+    {
+        let mut result = Vec::with_capacity(SQ_HEADER + N);
+        result.extend_from_slice(&value.min_val.to_le_bytes());
+        result.extend_from_slice(&value.max_val.to_le_bytes());
+        result.extend_from_slice(&value.codes);
+        result
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::internal(&format!("redb::vec::ScalarQuantized<{N}>"))
+    }
+}
+
+/// The decoded representation of a [`ScalarQuantized<N>`] value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SQVec<const N: usize> {
+    /// Minimum value of the original f32 vector (scale floor).
+    pub min_val: f32,
+    /// Maximum value of the original f32 vector (scale ceiling).
+    pub max_val: f32,
+    /// Quantized codes: each u8 maps linearly to `[min_val, max_val]`.
+    pub codes: [u8; N],
+}
+
+impl<const N: usize> SQVec<N> {
+    /// Dequantizes the codes back to f32 values.
+    #[inline]
+    pub fn dequantize(&self) -> [f32; N] {
+        let mut result = [0.0f32; N];
+        let range = self.max_val - self.min_val;
+        if range == 0.0 {
+            result.fill(self.min_val);
+        } else {
+            let scale = range / 255.0;
+            for (i, &code) in self.codes.iter().enumerate() {
+                result[i] = self.min_val + f32::from(code) * scale;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod truncated_vector_tests {
+    use super::FixedVec;
+    use crate::types::Value;
+
+    /// `from_bytes` is reached with whatever bytes are on disk, and the `Value`
+    /// trait gives it no way to report an error. Truncated input therefore has
+    /// to degrade, which the implementation does by zero-padding.
+    ///
+    /// A `debug_assert!` used to sit above that handling and fire on exactly
+    /// the same condition, so debug and fuzz builds crashed on input the
+    /// release build handled. `fuzz_quantization` hit it the first time that
+    /// target was ever executed, on a 2-byte input.
+    #[test]
+    fn truncated_input_zero_pads_instead_of_panicking() {
+        for len in [0usize, 1, 4, 15, 31] {
+            let data = vec![0xABu8; len];
+            let v = <FixedVec<8> as Value>::from_bytes(&data);
+            assert_eq!(v.len(), 8, "must always yield N elements");
+            // Bytes past the supplied prefix read as zero.
+            for (i, x) in v.iter().enumerate() {
+                if i * 4 >= len {
+                    // Compare bit patterns: exact, and lint-clean for floats.
+                    assert_eq!(
+                        x.to_bits(),
+                        0.0f32.to_bits(),
+                        "element {i} beyond {len} bytes must be zero"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A full-length buffer still round-trips, so the guard removal did not
+    /// change the behaviour that matters.
+    #[test]
+    fn full_length_input_round_trips() {
+        let original = [1.0f32, -2.5, 3.25, 0.0, 1e10, -1e-10, 42.0, 7.5];
+        let bytes = <FixedVec<8> as Value>::as_bytes(&original);
+        let decoded = <FixedVec<8> as Value>::from_bytes(&bytes);
+        for (d, o) in decoded.iter().zip(original.iter()) {
+            assert_eq!(d.to_bits(), o.to_bits());
+        }
+    }
+}

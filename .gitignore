@@ -1,0 +1,14 @@
+/target/
+/.cache/
+/.wt/
+/vendor/shodh-redb/target/
+/vendor/candle-core/
+/vendor/candle-kernels/
+/meshy-ai-to-stl/
+/.pi/
+/.zvec-grep/
+/.ruff_cache/
+/.mcp.json
+__pycache__/
+*.pyc
+.vercel
