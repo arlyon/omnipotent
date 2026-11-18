@@ -23,7 +23,7 @@ jobs:
           - runner: windows-2022
             asset: windows-x86_64.exe
             args: ''
-          - runner: macos-14
+          - runner: macos-15
             asset: macos-aarch64
             args: --no-default-features
     runs-on: ${{ matrix.runner }}

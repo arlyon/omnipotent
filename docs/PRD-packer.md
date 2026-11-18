@@ -77,6 +77,7 @@ on hosted runners. A published release triggers asset builds when the release to
 permits workflow chaining; otherwise manually dispatch Packer binaries with its tag.
 No separate release orchestrator, installers, signing or checksums.
 
-Actual remote releases require a Git repository/remote and GitHub permissions.
-This checkout currently has no Git metadata. A configured matrix is not evidence
-that Windows/macOS binaries have run; report local and remote evidence separately.
+The private repository is https://github.com/arlyon/omnipotent. Actions is allowed
+to create release PRs; actual release publication remains a manually authorised step.
+A configured matrix is not evidence that Windows/macOS binaries have run; report
+local and remote evidence separately.
