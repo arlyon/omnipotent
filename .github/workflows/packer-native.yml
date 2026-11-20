@@ -6,13 +6,16 @@ on:
         description: Optional existing omnipotent-pack-v tag to build and attach binaries to
         type: string
         default: ''
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Tag created by release-plz
+        type: string
+        required: true
 permissions:
   contents: read
 jobs:
   native:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'omnipotent-pack-v')
     strategy:
       fail-fast: false
       matrix:
@@ -30,12 +33,12 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
       ASSET: omnipotent-pack-${{ matrix.asset }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
+          ref: ${{ inputs.release_tag || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10

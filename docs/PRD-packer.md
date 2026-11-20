@@ -87,14 +87,12 @@ otherwise pinned public assets are downloaded under `--cache`/`OMNIPOTENT_CACHE`
 
 ## Releases
 
-release-plz owns versions, changelogs, git tags and GitHub releases, not crates.io
-publication. The manually authorised Release workflow opens release PRs or releases.
-Packer binaries builds native Linux x86-64, Windows x86-64 and macOS ARM64 assets
-on hosted runners. A published release triggers asset builds when the release token
-permits workflow chaining; otherwise manually dispatch Packer binaries with its tag.
-No separate release orchestrator, installers, signing or checksums.
+Release-plz owns versions, changelogs, tags and GitHub releases, not crates.io
+publication. A push to `main` opens or updates a release PR when needed. Merging
+that PR is the approval step: the resulting push publishes the release and calls
+Packer binaries in the same workflow to attach Linux x86-64, Windows x86-64 and
+macOS ARM64 executables. This uses GitHub's workflow token, not a PAT or a release
+event to start the builds.
 
-The repository is https://github.com/arlyon/omnipotent. Actions is allowed to
-create release PRs; actual release publication remains a manually authorised step.
-A configured matrix is not evidence that Windows/macOS binaries have run; report
-local and remote evidence separately.
+For recovery, either workflow can be dispatched manually. Packer binaries accepts
+the already-published packer tag when only the binary build needs retrying.

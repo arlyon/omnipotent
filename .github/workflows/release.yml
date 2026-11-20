@@ -1,21 +1,27 @@
 name: Release
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       command:
-        description: Explicitly authorize a release PR or publication
+        description: Manually retry release PR creation or publication
         type: choice
         options: [release-pr, release]
         default: release-pr
-permissions:
-  contents: write
-  pull-requests: write
-concurrency:
-  group: release-plz
-  cancel-in-progress: false
+permissions: {}
 jobs:
   release-plz:
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.sha }}
+      cancel-in-progress: false
+    outputs:
+      packer_tag: ${{ steps.publish.outputs.releases_created == 'true' && fromJSON(steps.publish.outputs.releases)[0].tag || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -25,10 +31,26 @@ jobs:
         with:
           cache: false
           install_args: rust
-      - uses: release-plz/action@038b3bb42de75ac07329d69e588c76d35563f038 # v0.5
+      - name: Publish merged release PR
+        id: publish
+        if: github.event_name == 'push' || inputs.command == 'release'
+        uses: release-plz/action@038b3bb42de75ac07329d69e588c76d35563f038 # v0.5
         with:
-          command: ${{ inputs.command }}
+          command: release
         env:
-          # A PAT can trigger the binary workflow on publication. With github.token,
-          # dispatch Packer binaries manually with the resulting release tag.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Open or update release PR
+        if: inputs.command == 'release-pr' || (github.event_name == 'push' && steps.publish.outputs.releases_created != 'true')
+        uses: release-plz/action@038b3bb42de75ac07329d69e588c76d35563f038 # v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+  packer-binaries:
+    needs: release-plz
+    if: needs.release-plz.outputs.packer_tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/packer-native.yml
+    with:
+      release_tag: ${{ needs.release-plz.outputs.packer_tag }}
