@@ -36,7 +36,7 @@ The antenna remains fused to the enclosure. No independent antenna animation is 
 
 ## Screen cleanup
 
-The original display was baked into a fragmented atlas and the shell's surface maps. `scripts/model_screen.py` repairs the measured screen region before texture downsampling:
+The original display was baked into a fragmented atlas and the shell's surface maps. The measured screen region was repaired before texture downsampling:
 
 - Base colour is replaced with uniform paper-white.
 - Tangent-space normal is replaced with a neutral normal.
@@ -53,23 +53,15 @@ The bezel and remaining shell maps are retained. The source still has uneven gen
 
 No decimation is applied. The source has 25,798 triangular faces; Blender imports 25,796, omitting two enclosure faces from a source containing zero-area triangles. The new screen adds 28 triangles, for **25,824 triangles across seven meshes**. Both texture variants retain that same geometry. The model is not validated for fabrication, watertightness, physical dimensions, or electrical safety.
 
-## Rebuild
+## Checked-in assets
 
-With Blender installed, from the repository root:
-
-```bash
-blender --background --threads 4 --python scripts/prepare-model.py -- \
-  --source ~/Downloads/model-obj.zip \
-  --output-dir assets/models/omnipotent-rebuilt
-```
-
-The script validates the exact source OBJ hash, extracts only the five expected data files into a temporary directory, repairs the screen, and refuses to overwrite a nonempty output directory. Use a new output directory. Blender 5.2.2 LTS and its bundled Python/NumPy were used; no pip package or additional executable was installed.
+The published GLBs were prepared in Blender 5.2.2 LTS. They are checked in and served as-is; the repository no longer includes a rebuild script.
 
 The root showcase also uses `assets/images/model-poster.webp` for the front-facing open state and `model-ready.webp` for a seated, readable reduced-motion fallback. Those are rendered derivatives, not additional model versions.
 
 ## Validation and limits
 
-Run `bash scripts/check.sh`. The model tests check buffer bounds, embedded maps, geometry/UVs/normals, material connections, exact screen aspect, analytic planarity, absence of screen normal/bump inputs, metadata, hierarchy, and texture-variant geometry equality. Browser checks cover the live display and assembly; see the root README.
+Run `python3 -B -m unittest discover -s tests -p 'test_model_assets.py'`. The model tests check buffer bounds, embedded maps, geometry/UVs/normals, material connections, exact screen aspect, analytic planarity, absence of screen normal/bump inputs, metadata, hierarchy, and texture-variant geometry equality. Browser checks cover the live display and assembly; see the root README.
 
 Additional Blender inspection hid the added screen and rendered the underlying atlas. Its old lettering was gone. Numerical checks of the cleaned interior confirmed uniform colour, neutral normal, and matte/nonmetallic data within PNG precision. Front-facing and separated views were inspected, and the exported GLB was loaded in the browser.
 

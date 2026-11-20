@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import unittest
 import xml.etree.ElementTree as ET
@@ -76,13 +75,6 @@ class SampleCatalog(unittest.TestCase):
                 parse_fixture_xml(archive.read("EPUB/" + item["href"]))
             for item in package.findall("opf:spine/opf:itemref", ns):
                 self.assertIn(item.attrib["idref"], manifest)
-
-    def test_generated_epub_is_reproducible(self):
-        spec = importlib.util.spec_from_file_location("sample_book", ROOT / "scripts/prepare-sample-book.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self.assertEqual((SAMPLE / "connection-check.epub").read_bytes(), module.book_bytes())
 
 
 if __name__ == "__main__":

@@ -21,7 +21,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          cache: false
+          install_args: rust
       - uses: release-plz/action@038b3bb42de75ac07329d69e588c76d35563f038 # v0.5
         with:
           command: ${{ inputs.command }}

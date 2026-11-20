@@ -9,8 +9,8 @@ publish.workspace = true
 [dependencies]
 embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
 embedded-io-async = "0.7"
-omnipotent-serve = { path = "../omnipotent-serve" }
-omnipotent-format = { path = "../omnipotent-format" }
+omnipotent-serve = { path = "../../crates/omnipotent-serve" }
+omnipotent-format = { path = "../../crates/omnipotent-format" }
 serde_json = "1"
 nanofish = { version = "=0.17.1", default-features = false }
 rustix = { version = "1", features = ["fs"] }

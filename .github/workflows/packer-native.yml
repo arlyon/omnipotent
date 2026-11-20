@@ -38,7 +38,10 @@ jobs:
           ref: ${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          cache: false
+          install_args: rust
       # CUDA libraries are loaded at runtime on Linux/Windows; no toolkit is needed to build.
       # Apple Silicon builds are CPU-only: embeddinggemma2-rust has no Metal backend.
       - name: Test package and chunker behaviour
@@ -46,22 +49,19 @@ jobs:
       - name: Build executable
         run: cargo build --locked --release -p omnipotent-pack ${{ matrix.args }}
       - name: Stage executable and optionally attach to the release
-        shell: python
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          import os, pathlib, shutil, subprocess
-          binary = pathlib.Path('target/release/omnipotent-pack' + ('.exe' if os.name == 'nt' else ''))
-          subprocess.run([str(binary), '--help'], check=True)
-          asset = pathlib.Path(os.environ['ASSET'])
-          shutil.copy2(binary, asset)
-          tag = os.environ['RELEASE_TAG']
-          if tag:
-              assert tag.startswith('omnipotent-pack-v'), 'unexpected release tag'
-              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-              tagged = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
-              assert head == tagged, 'release tag is not this commit'
-              subprocess.run(['gh', 'release', 'upload', tag, str(asset)], check=True)
+          binary=target/release/omnipotent-pack
+          if [[ "$RUNNER_OS" == Windows ]]; then binary+=.exe; fi
+          "$binary" --help
+          cp "$binary" "$ASSET"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            [[ "$RELEASE_TAG" == omnipotent-pack-v* ]] || { echo 'Unexpected release tag' >&2; exit 1; }
+            [[ "$(git rev-parse HEAD)" == "$(git rev-parse "$RELEASE_TAG^{commit}")" ]] || { echo 'Release tag is not this commit' >&2; exit 1; }
+            gh release upload "$RELEASE_TAG" "$ASSET"
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: omnipotent-pack-${{ matrix.asset }}

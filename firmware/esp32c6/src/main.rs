@@ -15,7 +15,7 @@ use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// Provided only to the local compiler by scripts/build-c6.py. Never log these.
+// Read from the local build environment. Never log these.
 const SSID: &str = env!("OMNIPOTENT_WIFI_SSID");
 const PASSWORD: &str = env!("OMNIPOTENT_WIFI_PASSWORD");
 

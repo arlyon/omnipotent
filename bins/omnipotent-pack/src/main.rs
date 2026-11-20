@@ -26,6 +26,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Ingect wikipedia from its structured export
     Wikipedia {
         #[arg(long)]
         input: Vec<PathBuf>,
@@ -49,6 +50,7 @@ enum Command {
         #[command(flatten)]
         model: ModelArgs,
     },
+    /// Take two or more fjall databases and merge them for finalization
     Merge {
         #[arg(long, required = true)]
         input: Vec<PathBuf>,
