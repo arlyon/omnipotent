@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/arlyon/omnipotent/compare/omnipotent-pack-v0.2.0...omnipotent-pack-v0.2.1) - 2026-11-20
+
+### Other
+
+- separate executable packages and use Mise for builds
+
 ## [0.2.0](https://github.com/arlyon/omnipotent/releases/tag/omnipotent-pack-v0.2.0) - 2026-11-20
 
 ### Changed
