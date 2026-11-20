@@ -11,7 +11,7 @@ use tokio::{
     task::{JoinSet, LocalSet},
 };
 
-const HELP: &str = "omnipotent-linux (--sample | --source file:///absolute/source) [--listen 127.0.0.1:8080]\n\n--sample serves the flash-backed OPDS 2.0 test catalog at /opds and its EPUB.\nRead-only native-file or finalized mixed-resource redb mount. GET/HEAD.\nDirectory: / resolves index.html; confined paths require Linux 5.6+. Relative\nsymlinks within the mount are allowed; symlink escapes are rejected.\nPackage: /resources/<package-local-u32> returns the native payload; append\n/metadata for shared Resource JSON. Requires progress.ready=true and clean close.\nSources must publish by atomic replacement, never modify an in-flight file.\n16 concurrent connections, 30-second total deadline each. Ctrl-C stops.\nNo client compression requirement, rendering, search, auth, or remote sync.\n";
+const HELP: &str = "omnipotent-linux (--sample | --source file:///absolute/source) [--listen 127.0.0.1:8080]\n\n--sample serves the flash-backed OPDS 2.0 test catalog at /opds and its EPUB.\nRead-only native-file directory or finalized .bin bundle. GET/HEAD.\nDirectory: / resolves index.html; confined paths require Linux 5.6+. Relative\nsymlinks within the mount are allowed; symlink escapes are rejected.\nBundle: /resources/<bundle-local-u32> returns an article record; append\n/metadata for shared Resource JSON.\nSources must publish by atomic replacement, never modify an in-flight file.\n16 concurrent connections, 30-second total deadline each. Ctrl-C stops.\nNo client compression requirement, rendering, search, auth, or remote sync.\n";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut source = None;

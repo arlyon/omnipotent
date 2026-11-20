@@ -1,6 +1,6 @@
 [package]
 name = "omnipotent-pack"
-version = "0.1.0"
+version = "0.2.0"
 description = "Prepare, embed, merge and finalise offline knowledge packages"
 edition.workspace = true
 rust-version = "1.91"
@@ -14,12 +14,14 @@ cuda = ["omnipotent-embed/cuda"]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 omnipotent-embed = { path = "../omnipotent-embed" }
-omnipotent-format = { path = "../omnipotent-format", features = ["storage"] }
+omnipotent-format = { path = "../omnipotent-format" }
 omnipotent-wikipedia = { path = "../omnipotent-wikipedia" }
 serde = { workspace = true, features = ["std"] }
 serde_json = "1"
-shodh-redb = { path = "../../vendor/shodh-redb", default-features = false, features = ["std"] }
-ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
-
-[dev-dependencies]
+fjall = "3.1.13"
+ndarray = "0.15"
+rand = "0.8"
+reductive = "0.9"
 tempfile = "3"
+zerocopy.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }

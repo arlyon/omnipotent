@@ -140,6 +140,64 @@ fn fixture() -> Article {
     }
 }
 
+#[test]
+fn stored_article_roundtrips_and_borrows_unaligned_nodes() {
+    let original = fixture();
+    let bytes = record::encode(&original).unwrap();
+    assert!(bytes.starts_with(b"OMNIART\0"));
+    let mut unaligned = vec![0];
+    unaligned.extend_from_slice(&bytes);
+    let view = Record::parse(&unaligned[1..]).unwrap();
+    let nodes: &[record::Node] = view.nodes();
+    assert_eq!(nodes.len(), 12);
+    assert_eq!(nodes[2].id.get(), 2);
+    assert_eq!(nodes[2].parent.get(), 2);
+    assert_eq!(nodes[2].text(&view).unwrap(), "Café water");
+    let range = unaligned.as_ptr() as usize..unaligned.as_ptr() as usize + unaligned.len();
+    assert!(range.contains(&(nodes.as_ptr() as usize)));
+    assert!(range.contains(&(nodes[2].text(&view).unwrap().as_ptr() as usize)));
+    assert_eq!(view.to_owned().unwrap(), original);
+    assert_eq!(view.title().unwrap(), original.title);
+    assert_eq!(
+        view.excerpt(Some(NodeId(NonZeroU32::new(2).unwrap())), 0, 5)
+            .unwrap(),
+        "Café"
+    );
+    assert_eq!(
+        view.heading(Some(NodeId(NonZeroU32::new(4).unwrap())))
+            .unwrap(),
+        "Structure > Term"
+    );
+    assert_eq!(
+        view.heading(Some(NodeId(NonZeroU32::new(7).unwrap())))
+            .unwrap(),
+        "Structure > Facts > Name"
+    );
+}
+
+#[test]
+fn record_rejects_bad_bounds_and_utf8_and_shares_repeated_strings() {
+    let mut original = fixture();
+    let title = original.title.clone();
+    paragraph(&mut original).value = title;
+    let mut bytes = record::encode(&original).unwrap();
+    let offset = {
+        let view = Record::parse(&bytes).unwrap();
+        assert_eq!(
+            view.title().unwrap().as_ptr(),
+            view.node_text(Some(NodeId(NonZeroU32::new(2).unwrap())))
+                .unwrap()
+                .as_ptr()
+        );
+        view.title().unwrap().as_ptr() as usize - bytes.as_ptr() as usize
+    };
+    assert!(Record::parse(&bytes[..31]).is_err());
+    assert!(Record::parse(&bytes[..bytes.len() - 1]).is_err());
+    bytes[offset] = 255;
+    assert!(Record::parse(&bytes).unwrap().title().is_err());
+    assert!(Record::parse(&bytes).unwrap().to_owned().is_err());
+}
+
 fn paragraph(article: &mut Article) -> &mut Text {
     let Part::Section { children, .. } = &mut article.parts[0].content else {
         panic!("fixture section")
@@ -241,6 +299,8 @@ fn all_link_states_are_distinct_and_roundtrip() {
         let json = serde_json::to_vec(&article).unwrap();
         let decoded: Article = serde_json::from_slice(&json).unwrap();
         assert_eq!(decoded.links[0].target, target);
+        let bytes = record::encode(&article).unwrap();
+        assert_eq!(Record::parse(&bytes).unwrap().to_owned().unwrap(), article);
     }
 }
 

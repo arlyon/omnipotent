@@ -38,18 +38,14 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
-        no_finalize: bool,
-        #[arg(long)]
         limit: Option<usize>,
         #[command(flatten)]
         model: ModelArgs,
     },
-    /// Finish embedding a prepared database; already committed vectors are retained.
+    /// Resume embedding a prepared worker; already committed vectors are retained.
     Embed {
         #[arg(long)]
         output: PathBuf,
-        #[arg(long)]
-        no_finalize: bool,
         #[command(flatten)]
         model: ModelArgs,
     },
@@ -58,10 +54,11 @@ enum Command {
         input: Vec<PathBuf>,
         #[arg(long)]
         output: PathBuf,
-        #[arg(long)]
-        no_finalize: bool,
     },
+    /// Export a complete worker as an immutable .bin bundle.
     Finalize {
+        #[arg(long)]
+        input: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
@@ -100,9 +97,9 @@ impl ModelArgs {
         }
         Ok(directory)
     }
-    fn embed(&self, package: &mut Package, directory: &Path, no_finalize: bool) -> Result<()> {
+    fn embed(&self, package: &mut Package, directory: &Path) -> Result<()> {
         ensure!(
-            package.profile()?.model == format!("{MODEL}@{MODEL_REVISION}"),
+            package.profile().model == format!("{MODEL}@{MODEL_REVISION}"),
             "package was prepared for a different embedding model"
         );
         let start = Instant::now();
@@ -111,9 +108,6 @@ impl ModelArgs {
         let start = Instant::now();
         package.embed(&encoder, self.batch_size as usize)?;
         eprintln!("inference + commits: {:.3}s", start.elapsed().as_secs_f64());
-        if !no_finalize {
-            package.finalize()?;
-        }
         Ok(())
     }
 }
@@ -125,7 +119,6 @@ fn main() -> Result<()> {
             language,
             dataset_revision,
             output,
-            no_finalize,
             limit,
             model,
         } => {
@@ -162,7 +155,7 @@ fn main() -> Result<()> {
                 for article in omnipotent_wikipedia::articles(File::open(&path)?)? {
                     let article = article.with_context(|| format!("source {}", path.display()))?;
                     let passages =
-                        chunker.chunk(ResourceKind::Article, &article, package.next_document()?)?;
+                        chunker.chunk(ResourceKind::Article, &article, package.next_document())?;
                     package.add_article(&article, &passages)?;
                     articles += 1;
                     if limit.is_some_and(|n| articles >= n) {
@@ -175,28 +168,17 @@ fn main() -> Result<()> {
                 "prepared {articles} articles in {:.3}s",
                 start.elapsed().as_secs_f64()
             );
-            model.embed(&mut package, &directory, no_finalize)?;
+            model.embed(&mut package, &directory)?;
         }
-        Command::Embed {
-            output,
-            no_finalize,
-            model,
-        } => {
+        Command::Embed { output, model } => {
             let mut package = Package::open(&output)?;
             let directory = model.directory()?;
-            model.embed(&mut package, &directory, no_finalize)?;
+            model.embed(&mut package, &directory)?;
         }
-        Command::Merge {
-            input,
-            output,
-            no_finalize,
-        } => {
-            let mut package = merge(&input, &output)?;
-            if !no_finalize {
-                package.finalize()?;
-            }
+        Command::Merge { input, output } => {
+            merge(&input, &output)?;
         }
-        Command::Finalize { output } => Package::open(&output)?.finalize()?,
+        Command::Finalize { input, output } => Package::open(&input)?.finalize(&output)?,
     }
     Ok(())
 }

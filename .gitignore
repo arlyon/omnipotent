@@ -1,7 +1,6 @@
 /target/
 /.cache/
 /.wt/
-/vendor/shodh-redb/target/
 /vendor/candle-core/
 /vendor/candle-kernels/
 /meshy-ai-to-stl/

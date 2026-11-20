@@ -1,20 +1,14 @@
 [package]
 name = "omnipotent-format"
 version = "0.2.0"
-description = "Portable resource and article model with mixed redb package readers"
+description = "Portable article records and zero-copy search bundles"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[features]
-default = []
-storage = ["dep:shodh-redb", "dep:serde_json"]
-
 [dependencies]
 serde.workspace = true
 zerocopy.workspace = true
-serde_json = { version = "1.0.154", default-features = false, features = ["alloc"], optional = true }
-shodh-redb = { path = "../../vendor/shodh-redb", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_json = { version = "1.0.154", default-features = false, features = ["alloc"] }

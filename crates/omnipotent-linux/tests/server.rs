@@ -212,19 +212,15 @@ fn invalid_sources_fail_explicitly() {
 }
 
 #[test]
-fn finalized_assembler_bundle_streams_article_metadata_and_native_publication() {
-    use omnipotent_format::package::{
-        ARTICLE_MEDIA_TYPE, EmbeddingProfile, ObjectRef, Resource, ResourceKind,
-    };
-    use omnipotent_format::reader::{META, PackageReader};
+fn finalized_bundle_streams_article_and_metadata() {
+    use omnipotent_format::package::{ARTICLE_MEDIA_TYPE, EmbeddingProfile, Resource};
     use omnipotent_format::{
-        Article, DocumentId, LocalId, Provenance, ResourceId, ResourceKey, SourceId,
+        Article, DocumentId, Provenance, ResourceId, ResourceKey, SourceId, bundle::Bundle,
     };
     use omnipotent_pack::Package;
-    use shodh_redb::ReadableDatabase;
     use std::collections::BTreeMap;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("library.redb");
+    let path = dir.path().join("library.bin");
     let profile = EmbeddingProfile {
         model: "reader-fixture".into(),
         files: BTreeMap::new(),
@@ -232,7 +228,7 @@ fn finalized_assembler_bundle_streams_article_metadata_and_native_publication() 
         document_template: String::new(),
         query_template: String::new(),
     };
-    let mut package = Package::create(&path, &profile).unwrap();
+    let mut package = Package::create(&dir.path().join("worker"), &profile).unwrap();
     let provenance = Provenance {
         origin_uri: None,
         language: None,
@@ -244,7 +240,7 @@ fn finalized_assembler_bundle_streams_article_metadata_and_native_publication() 
         "Prepared Wikipedia fixture {}",
         "native representation ".repeat(500)
     );
-    for id in 1..=256 {
+    for id in 1..=2 {
         let article = Article {
             id: ResourceId {
                 source: SourceId::new("wikipedia:en").unwrap(),
@@ -263,46 +259,15 @@ fn finalized_assembler_bundle_streams_article_metadata_and_native_publication() 
         };
         package.add_article(&article, &[]).unwrap();
     }
-    let pdf: Vec<u8> = b"%PDF-1.7\nNative publication bytes\n".repeat(10_000);
-    let pdf_path = dir.path().join("book.pdf");
-    fs::write(&pdf_path, &pdf).unwrap();
-    package
-        .add_native(
-            Resource {
-                id: ResourceId {
-                    source: SourceId::new("manuals").unwrap(),
-                    key: ResourceKey::new("guide").unwrap(),
-                },
-                kind: ResourceKind::Publication,
-                title: "Native publication".into(),
-                media_type: "application/pdf".into(),
-                provenance,
-                payload: ObjectRef {
-                    object: LocalId::new("pending").unwrap(),
-                    length: 0,
-                },
-            },
-            &pdf_path,
-        )
-        .unwrap();
-    // Live databases cannot be mounted even before the readiness check.
-    let uri = format!("file://{}", path.display());
-    assert!(omnipotent_linux::SourceMount::from_uri(&uri).is_err());
     package.finish_preparation().unwrap();
     package.finish_embedding().unwrap();
-    package.finalize().unwrap();
-    let (expected, metadata) = {
-        let txn = package.db.begin_read().unwrap();
-        let reader = PackageReader::open(&txn).unwrap();
-        let resource = reader.resource(DocumentId(0)).unwrap();
-        let mut body = reader.payload(DocumentId(0)).unwrap();
-        (
-            body.read_range(0, body.len() as usize).unwrap(),
-            serde_json::to_vec(&resource).unwrap(),
-        )
-    };
+    package.finalize(&path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let expected = Bundle::parse(&bytes)
+        .unwrap()
+        .article_bytes(DocumentId(0))
+        .unwrap();
     assert!(expected.len() > omnipotent_serve::STREAM_BUFFER_SIZE);
-    drop(package); // Finalized and closed before the source opens it.
     {
         let server = Server::start(&path);
         let response = server.request("GET", "/resources/0");
@@ -319,21 +284,12 @@ fn finalized_assembler_bundle_streams_article_metadata_and_native_publication() 
                 .contains("content-encoding:")
         );
         assert_eq!(split(&response).1, expected);
-        let decoded: omnipotent_format::Article =
-            serde_json::from_slice(split(&response).1).unwrap();
-        assert_eq!(decoded.title, title);
-        assert_eq!(
-            split(&server.request("GET", "/resources/0/metadata")).1,
-            metadata
-        );
-        let response = server.request("GET", "/resources/256");
-        assert!(
-            split(&response)
-                .0
-                .to_ascii_lowercase()
-                .contains("content-type: application/pdf")
-        );
-        assert_eq!(split(&response).1, pdf);
+        let view = omnipotent_format::Record::parse(split(&response).1).unwrap();
+        assert_eq!(view.title().unwrap(), title);
+        let response = server.request("GET", "/resources/0/metadata");
+        let metadata: Resource = serde_json::from_slice(split(&response).1).unwrap();
+        assert_eq!(metadata.title, title);
+        assert_eq!(metadata.payload.length, expected.len() as u64);
         let response = server.request("HEAD", "/resources/0");
         assert!(split(&response).1.is_empty());
         assert!(
@@ -348,17 +304,10 @@ fn finalized_assembler_bundle_streams_article_metadata_and_native_publication() 
                 .starts_with("HTTP/1.1 404")
         );
     }
-    // A cleanly closed but unfinished package is refused on startup.
-    {
-        let db = shodh_redb::Database::open(&path).unwrap();
-        let txn = db.begin_write().unwrap();
-        txn.open_table(META)
-            .unwrap()
-            .insert("progress", b"{\"ready\":false}".as_slice())
-            .unwrap();
-        txn.commit().unwrap();
-    }
-    assert!(omnipotent_linux::SourceMount::from_uri(&uri).is_err());
+    fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+    assert!(
+        omnipotent_linux::SourceMount::from_uri(&format!("file://{}", path.display())).is_err()
+    );
 }
 
 #[test]

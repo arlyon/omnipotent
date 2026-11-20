@@ -1,16 +1,15 @@
-//! Shared mixed-resource package schema. Payloads live in blob storage; only
-//! Articles use our structured JSON representation. Native files stay unchanged.
+//! Shared resource metadata and passage locations for packed article bundles.
 use alloc::string::String;
 use serde::{Deserialize, Serialize};
 
 use crate::{DocumentId, LocalId, NodeId, Provenance, ResourceId};
+use core::num::NonZeroU32;
+use zerocopy::{
+    FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, byteorder::little_endian::U32,
+};
 
-pub const PACKAGE_VERSION: u32 = 2;
-pub const ARTICLE_MEDIA_TYPE: &str = "application/vnd.omnipotent.article+json";
-pub const MAX_METADATA_BYTES: usize = 256 * 1024;
+pub const ARTICLE_MEDIA_TYPE: &str = "application/vnd.omnipotent.article+binary";
 pub const MAX_ARTICLE_BYTES: usize = 16 * 1024 * 1024;
-pub const EMBEDDING_DIMENSIONS: usize = 768;
-pub const VECTOR_INDEX_NAME: &str = "passage_embeddings";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +68,62 @@ pub enum SearchLocation {
     Native { fragment: Option<String> },
 }
 
+/// Exactly 16 stored bytes, in the same row order as the bundle's codes and vectors.
+/// Node zero denotes the abstract. Text and headings live only in the article.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub struct PassageRef {
+    resource: U32,
+    node: U32,
+    start: U32,
+    end: U32,
+}
+impl PassageRef {
+    pub fn new(
+        resource: DocumentId,
+        node: Option<NodeId>,
+        start: u32,
+        end: u32,
+    ) -> Result<Self, crate::RecordError> {
+        if start >= end {
+            return Err(crate::RecordError::Invalid);
+        }
+        Ok(Self {
+            resource: U32::new(resource.0),
+            node: U32::new(node.map_or(0, |n| n.0.get())),
+            start: U32::new(start),
+            end: U32::new(end),
+        })
+    }
+    pub fn parse(bytes: &[u8]) -> Result<&Self, crate::RecordError> {
+        let r = Self::ref_from_bytes(bytes).map_err(|_| crate::RecordError::Size)?;
+        if r.start.get() >= r.end.get() {
+            return Err(crate::RecordError::Invalid);
+        }
+        Ok(r)
+    }
+    pub fn bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+    pub fn resource(&self) -> DocumentId {
+        DocumentId(self.resource.get())
+    }
+    pub fn remap(&mut self, resource: DocumentId) {
+        self.resource = U32::new(resource.0);
+    }
+    pub fn node(&self) -> Option<NodeId> {
+        NonZeroU32::new(self.node.get()).map(NodeId)
+    }
+    pub fn start(&self) -> u32 {
+        self.start.get()
+    }
+    pub fn end(&self) -> u32 {
+        self.end.get()
+    }
+}
+const _: [(); 16] = [(); core::mem::size_of::<PassageRef>()];
+
+/// In-memory preparation/search result; its text/heading are never persisted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchEntry {
@@ -97,24 +152,6 @@ impl SearchEntry {
     }
 }
 
-/// The query-facing subset of the assembler's training settings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VectorIndex {
-    pub dimensions: u32,
-    pub clusters: u32,
-    pub subvectors: u32,
-    pub retain_raw_for_rerank: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SearchHit {
-    pub vector: u64,
-    pub distance: f32,
-    pub entry: SearchEntry,
-}
-
 /// Model identity and actual asset hashes, shared by host/client query encoders.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,8 +161,4 @@ pub struct EmbeddingProfile {
     pub dimensions: usize,
     pub document_template: String,
     pub query_template: String,
-}
-
-pub fn supported_dimensions(dimensions: usize) -> bool {
-    [128, 256, 512, 768].contains(&dimensions)
 }

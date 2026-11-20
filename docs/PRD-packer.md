@@ -10,8 +10,23 @@ simplifications and selection of `embeddinggemma2-rust` supersede that design.
   iterator. No model or storage code; no `serde_json::Value` conversion.
 - `omnipotent-embed`: pillar dispatch, `chunkers/article.rs`, token-aware splitting,
   batch planning, and the pinned `embeddinggemma2-rust` backend.
-- `omnipotent-pack`: thin CLI and package assembly operations. redb stores articles,
-  located passages, temporary token rows and full raw vectors.
+- `omnipotent-pack`: thin CLI and package assembly operations. Fjall worker directories
+  store article records, passage locations, temporary tokens, and model vectors.
+
+## Stored article and passage layout
+
+`record.rs` defines the stored article: a little-endian header, fixed 28-byte
+nodes in preorder, and shared string and auxiliary data. The worker keys records
+by package-local article ID and writes those bytes unchanged into the bundle.
+`Bundle::article(id)?.nodes()` and node text borrow directly from the bundle bytes.
+
+Each passage reference is exactly 16 bytes: article ID, node ID (zero for abstract),
+start and end byte offsets. Passage text and headings are not stored again.
+`bundle.rs` defines the flat v1 `.bin` layout: a 16-byte header, cluster boundaries,
+centroids, codebooks, codes, vectors, passage references, article boundaries, and
+records. The row number connects code, vector and passage. Linux serves article
+records as `application/vnd.omnipotent.article+binary` and serves native files
+from mounted directories. This does not implement the device's flash backend.
 
 Only article chunking is implemented. Publication extraction will use xberg;
 publication, map, media and data chunkers remain TODOs. Article chunking visits
@@ -24,7 +39,7 @@ the current search-location schema does not address table cells or reference tex
 1. Convert every article in the worker's selected shards.
 2. Chunk with title/heading context. Final model inputs contain at most 384 tokens,
    including special tokens. Preserve UTF-8 byte locations; no overlap.
-3. Commit article content, search entries and little-endian u32 token rows to redb.
+3. Commit the article record, passage locations and little-endian u32 token rows to Fjall.
 4. Finish preparation for the entire worker dataset.
 5. Load only `(token count, passage ID)` descriptors and globally sort them.
 6. Greedily batch adjacent lengths, with both `count <= --batch-size` (default 128)
@@ -46,22 +61,24 @@ are never overwritten implicitly. Model files and source caches are not deleted.
 
 ## Assembly
 
-Merge copies completed worker databases without a model or re-embedding. It
-remaps package-local resource, payload and passage IDs, retains logical identities,
+Merge copies completed, unfinalised worker databases without a model or re-embedding. It
+remaps package-local article and passage IDs, retains logical identities,
 and copies vectors in bounded transactions. Duplicate logical resource identities
 and different embedding profiles are errors. The operator assigns disjoint inputs;
 there is no deduplication policy or general asset installation pipeline.
 
-Finalisation is independent of sources, token rows and model files. It trains one
-search index from a bounded global sample, inserts all vectors, compacts the file,
-and marks it ready. The index uses normalised 256d Matryoshka prefixes; raw 768d
-vectors remain available. Non-finalised worker files are not serving-ready.
+Finalisation is independent of sources, token rows and model files. `reductive`
+trains IVF centroids and PQ codebooks from a bounded sample of 256d Matryoshka
+prefixes, L2-normalised **after** truncation. The packer writes one 256d FP32
+vector plus one PQ code per passage to a new `.bin`. The output is published
+only after it is fully written, never overwrites another file, and contains no
+worker data. A complete worker remains available for another merge or export.
 
 ```sh
-omnipotent-pack wikipedia --shards 0..10 --output a.redb --no-finalize
-omnipotent-pack wikipedia --shards 10..20 --output b.redb --no-finalize
-omnipotent-pack merge --input a.redb --input b.redb --output all.redb --no-finalize
-omnipotent-pack finalize --output all.redb
+omnipotent-pack wikipedia --shards 0..10 --output a.worker
+omnipotent-pack wikipedia --shards 10..20 --output b.worker
+omnipotent-pack merge --input a.worker --input b.worker --output all.worker
+omnipotent-pack finalize --input all.worker --output all.bin
 ```
 
 `--input PATH` accepts local Parquet shards instead of downloading. `--limit N`
@@ -77,7 +94,7 @@ on hosted runners. A published release triggers asset builds when the release to
 permits workflow chaining; otherwise manually dispatch Packer binaries with its tag.
 No separate release orchestrator, installers, signing or checksums.
 
-The private repository is https://github.com/arlyon/omnipotent. Actions is allowed
-to create release PRs; actual release publication remains a manually authorised step.
+The repository is https://github.com/arlyon/omnipotent. Actions is allowed to
+create release PRs; actual release publication remains a manually authorised step.
 A configured matrix is not evidence that Windows/macOS binaries have run; report
 local and remote evidence separately.

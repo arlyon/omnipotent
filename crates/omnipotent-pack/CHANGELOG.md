@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/arlyon/omnipotent/releases/tag/omnipotent-pack-v0.2.0) - 2026-11-20
+
+### Changed
+
+- Use Fjall worker directories for Wikipedia preparation, embedding, resume, and merge.
+- Run `omnipotent-pack finalize --input WORKER --output BUNDLE.bin` separately, without loading the embedding model.
+- Write a packed, read-only bundle with one 256-dimensional vector and one IVF-PQ code per passage. The previous database files are no longer supported.
+
 ## [0.1.0](https://github.com/arlyon/omnipotent/releases/tag/omnipotent-pack-v0.1.0) - 2026-11-18
 
 ### Added

@@ -21,8 +21,8 @@ enum Source {
     Sample,
 }
 
-/// One local source: a scoped native directory or a finalized mixed-resource
-/// package. Package paths are `/resources/<package-local-u32>` (native payload)
+/// One local source: a scoped native directory or an immutable article bundle.
+/// Bundle paths are `/resources/<bundle-local-u32>` (article record)
 /// and `/resources/<package-local-u32>/metadata` (shared Resource metadata).
 #[derive(Clone)]
 pub struct SourceMount(Source);
@@ -39,7 +39,7 @@ impl SourceMount {
         Ok(Self(if std::fs::metadata(path)?.is_dir() {
             Source::Directory(FileMount::from_uri(uri)?)
         } else {
-            Source::Bundle(bundle::BundleMount::open(path)?)
+            Source::Bundle(bundle::BundleMount::open(Path::new(path))?)
         }))
     }
     pub async fn serve_socket(&self, socket: TcpStream, deadline: Duration) -> io::Result<()> {

@@ -1,431 +1,370 @@
-//! Shared package assembly operations used by the thin CLI.
+//! Fjall workers and offline bundle assembly.
+mod output;
 #[cfg(test)]
 mod tests;
+
 use anyhow::{Context, Result, ensure};
-use omnipotent_embed::{DIMENSIONS, Encoder, MAX_BATCH_SIZE, PreparedPassage, batch_len};
-use omnipotent_format::{Article, DocumentId, LocalId, package::*, reader::*};
-use serde::{Deserialize, Serialize};
-use shodh_redb::{
-    ContentType, Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable,
-    ReadableTableMetadata, StoreOptions, TableDefinition,
+use fjall::{
+    Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch as WriteBatch, PersistMode,
 };
+use omnipotent_embed::{DIMENSIONS, Encoder, PreparedPassage, batch_len};
+use omnipotent_format::{
+    Article, DocumentId, Record,
+    package::{EmbeddingProfile, MAX_ARTICLE_BYTES, PassageRef, SearchLocation},
+};
+use serde::{Deserialize, Serialize};
 use std::{
-    fs::{File, OpenOptions},
-    io::Read,
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
+};
+use zerocopy::{
+    FromBytes, IntoBytes,
+    little_endian::{F32, U32},
 };
 
-const TOKENS: TableDefinition<u64, &[u8]> = TableDefinition::new("prepared_tokens");
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+type RawVector = [F32; DIMENSIONS];
+const WORKER_MARKER: &str = "omnipotent-worker-v1";
+const KEYSPACES: [&str; 6] = [
+    "metadata",
+    "articles",
+    "identities",
+    "passages",
+    "tokens",
+    "vectors",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Stage {
     Preparing,
     Embedding,
     Complete,
-    Ready,
 }
-#[derive(Serialize, Deserialize)]
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Progress {
     stage: Stage,
-    ready: bool,
+    documents: u32,
+    passages: u64,
+    embedded: u64,
 }
 
 pub struct Package {
-    pub db: Database,
+    db: Database,
+    meta: Keyspace,
+    articles: Keyspace,
+    identities: Keyspace,
+    passages: Keyspace,
+    tokens: Keyspace,
+    vectors: Keyspace,
+    progress: Progress,
+    profile: EmbeddingProfile,
 }
+
 impl Package {
     pub fn create(path: &Path, profile: &EmbeddingProfile) -> Result<Self> {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .with_context(|| {
-                format!(
-                    "creating new output {} (will not overwrite)",
-                    path.display()
-                )
-            })?;
-        let package = Self {
-            db: Database::create(path)?,
+        fs::create_dir(path).with_context(|| {
+            format!(
+                "creating new worker {} (will not overwrite)",
+                path.display()
+            )
+        })?;
+        let db = Database::builder(path).open()?;
+        let progress = Progress {
+            stage: Stage::Preparing,
+            documents: 0,
+            passages: 0,
+            embedded: 0,
         };
-        let tx = package.db.begin_write()?;
-        {
-            let mut meta = tx.open_table(META)?;
-            meta.insert("schema", PACKAGE_VERSION.to_le_bytes().as_slice())?;
-            meta.insert("embedding_profile", serde_json::to_vec(profile)?.as_slice())?;
-            meta.insert(
-                "progress",
-                serde_json::to_vec(&Progress {
-                    stage: Stage::Preparing,
-                    ready: false,
-                })?
-                .as_slice(),
-            )?;
-        }
-        tx.open_table(RESOURCES)?;
-        tx.open_table(IDENTITIES)?;
-        tx.open_table(OBJECTS)?;
-        tx.open_table(PASSAGES)?;
-        tx.open_table(VECTORS)?;
-        tx.open_table(TOKENS)?;
-        tx.commit()?;
-        Ok(package)
+        let worker = Self::tables(db, progress, profile.clone())?;
+        let mut batch = worker.batch();
+        batch.insert(&worker.meta, "profile", serde_json::to_vec(profile)?);
+        worker.commit(batch, progress)?;
+        fs::File::create_new(path.join(WORKER_MARKER))?.sync_all()?;
+        Ok(worker)
     }
+
     pub fn open(path: &Path) -> Result<Self> {
-        ensure!(path.is_file(), "package does not exist: {}", path.display());
-        let package = Self {
-            db: Database::open(path)?,
-        };
-        PackageReader::open(&package.db.begin_read()?)?;
-        Ok(package)
+        ensure!(
+            path.join(WORKER_MARKER).is_file(),
+            "expected an Omnipotent worker directory: {}",
+            path.display()
+        );
+        let db = Database::builder(path).open()?;
+        ensure!(
+            KEYSPACES.iter().all(|name| db.keyspace_exists(name)),
+            "not an Omnipotent worker: {}",
+            path.display()
+        );
+        let meta = db.keyspace(KEYSPACES[0], KeyspaceCreateOptions::default)?;
+        let profile =
+            serde_json::from_slice(&meta.get("profile")?.context("missing worker profile")?)?;
+        let progress =
+            serde_json::from_slice(&meta.get("progress")?.context("missing worker progress")?)?;
+        Self::tables(db, progress, profile)
     }
-    pub fn stage(&self) -> Result<Stage> {
-        let tx = self.db.begin_read()?;
-        let table = tx.open_table(META)?;
-        let bytes = table.get("progress")?.context("missing progress")?;
-        Ok(serde_json::from_slice::<Progress>(bytes.value())?.stage)
+
+    fn tables(db: Database, progress: Progress, profile: EmbeddingProfile) -> Result<Self> {
+        let [meta, articles, identities, passages, tokens, vectors] = KEYSPACES;
+        Ok(Self {
+            meta: db.keyspace(meta, KeyspaceCreateOptions::default)?,
+            articles: db.keyspace(articles, KeyspaceCreateOptions::default)?,
+            identities: db.keyspace(identities, KeyspaceCreateOptions::default)?,
+            passages: db.keyspace(passages, KeyspaceCreateOptions::default)?,
+            tokens: db.keyspace(tokens, KeyspaceCreateOptions::default)?,
+            vectors: db.keyspace(vectors, KeyspaceCreateOptions::default)?,
+            db,
+            progress,
+            profile,
+        })
     }
-    fn set_stage(&self, stage: Stage) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(META)?.insert(
-            "progress",
-            serde_json::to_vec(&Progress {
-                stage,
-                ready: stage == Stage::Ready,
-            })?
-            .as_slice(),
-        )?;
-        tx.commit()?;
+
+    fn batch(&self) -> WriteBatch {
+        self.db.batch().durability(Some(PersistMode::SyncAll))
+    }
+    fn commit(&self, mut batch: WriteBatch, progress: Progress) -> Result<()> {
+        batch.insert(&self.meta, "progress", serde_json::to_vec(&progress)?);
+        batch.commit()?;
         Ok(())
     }
-    pub fn profile(&self) -> Result<EmbeddingProfile> {
-        Ok(PackageReader::open(&self.db.begin_read()?)?.embedding_profile()?)
+    fn advance(&mut self, batch: WriteBatch, progress: Progress) -> Result<()> {
+        self.commit(batch, progress)?;
+        self.progress = progress;
+        Ok(())
     }
-    pub fn next_document(&self) -> Result<DocumentId> {
-        Ok(DocumentId(
-            self.db
-                .begin_read()?
-                .open_table(RESOURCES)?
-                .len()?
-                .try_into()?,
-        ))
+    pub fn stage(&self) -> Stage {
+        self.progress.stage
     }
-    pub fn add_article(&self, article: &Article, prepared: &[PreparedPassage]) -> Result<()> {
-        ensure!(self.stage()? == Stage::Preparing, "preparation is closed");
-        let bytes = serde_json::to_vec(article)?;
+    pub fn profile(&self) -> &EmbeddingProfile {
+        &self.profile
+    }
+    pub fn next_document(&self) -> DocumentId {
+        DocumentId(self.progress.documents)
+    }
+
+    fn insert_article(&self, batch: &mut WriteBatch, bytes: &[u8]) -> Result<()> {
         ensure!(
             bytes.len() <= MAX_ARTICLE_BYTES,
             "article exceeds package size limit"
         );
-        let resource = Resource {
-            id: article.id.clone(),
-            kind: ResourceKind::Article,
-            title: article.title.clone(),
-            media_type: ARTICLE_MEDIA_TYPE.into(),
-            provenance: article.provenance.clone(),
-            payload: ObjectRef {
-                object: LocalId::new("pending")?,
-                length: bytes.len() as u64,
-            },
-        };
-        self.add_resource(resource, bytes.as_slice(), prepared)
-    }
-    pub fn add_native(&self, resource: Resource, path: &Path) -> Result<()> {
+        let (source, key) = Record::parse(bytes)?.resource_id()?;
+        let identity = serde_json::to_vec(&(source, key))?;
         ensure!(
-            resource.kind != ResourceKind::Article,
-            "use add_article for articles"
+            !self.identities.contains_key(&identity)?,
+            "duplicate resource {source}/{key}"
         );
-        self.add_resource(resource, File::open(path)?, &[])
-    }
-    fn add_resource(
-        &self,
-        mut resource: Resource,
-        mut payload: impl Read,
-        prepared: &[PreparedPassage],
-    ) -> Result<()> {
-        ensure!(self.stage()? == Stage::Preparing, "preparation is closed");
-        ensure!(resource.is_valid(), "invalid resource metadata");
-        let tx = self.db.begin_write()?;
-        let document: u32 = tx.open_table(RESOURCES)?.len()?.try_into()?;
-        let identity = serde_json::to_vec(&resource.id)?;
-        ensure!(
-            tx.open_table(IDENTITIES)?
-                .get(identity.as_slice())?
-                .is_none(),
-            "duplicate resource {:?}",
-            resource.id
+        batch.insert(
+            &self.identities,
+            identity,
+            self.progress.documents.to_be_bytes(),
         );
-        let object = format!("resource/{document}/payload");
-        let mut writer = tx.blob_writer(
-            ContentType::OctetStream,
-            "resource",
-            StoreOptions::default(),
-        )?;
-        let mut buffer = [0; 65536];
-        let mut length = 0;
-        loop {
-            let count = payload.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            writer.write(&buffer[..count])?;
-            length += count as u64;
-        }
-        let blob = writer.finish()?;
-        resource.payload = ObjectRef {
-            object: LocalId::new(object.clone())?,
-            length,
-        };
-        let metadata = serde_json::to_vec(&resource)?;
-        ensure!(
-            metadata.len() <= MAX_METADATA_BYTES,
-            "resource metadata exceeds package size limit"
-        );
-        tx.open_table(OBJECTS)?.insert(object.as_str(), blob)?;
-        tx.open_table(RESOURCES)?
-            .insert(document, metadata.as_slice())?;
-        tx.open_table(IDENTITIES)?
-            .insert(identity.as_slice(), document)?;
-        let mut passages = tx.open_table(PASSAGES)?;
-        let mut tokens = tx.open_table(TOKENS)?;
-        for (id, passage) in (passages.len()?..).zip(prepared) {
-            ensure!(
-                passage.entry.resource == DocumentId(document) && passage.entry.matches(&resource),
-                "passage location/resource mismatch"
-            );
-            batch_len([passage.tokens.len()], MAX_BATCH_SIZE)?;
-            let bytes = serde_json::to_vec(&passage.entry)?;
-            ensure!(
-                bytes.len() <= MAX_METADATA_BYTES,
-                "passage exceeds metadata size limit"
-            );
-            passages.insert(id, bytes.as_slice())?;
-            let bytes: Vec<_> = passage
-                .tokens
-                .iter()
-                .flat_map(|t| t.to_le_bytes())
-                .collect();
-            tokens.insert(id, bytes.as_slice())?;
-        }
-        drop(tokens);
-        drop(passages);
-        tx.commit()?;
+        batch.insert(&self.articles, self.progress.documents.to_be_bytes(), bytes);
         Ok(())
     }
-    pub fn finish_preparation(&self) -> Result<()> {
-        ensure!(self.stage()? == Stage::Preparing, "not preparing");
-        self.set_stage(Stage::Embedding)
+
+    pub fn add_article(&mut self, article: &Article, prepared: &[PreparedPassage]) -> Result<()> {
+        ensure!(self.stage() == Stage::Preparing, "preparation is closed");
+        let bytes = omnipotent_format::record::encode(article)?;
+        let view = Record::parse(&bytes)?;
+        let mut batch = self.batch();
+        self.insert_article(&mut batch, &bytes)?;
+        let mut progress = self.progress;
+        progress.documents = progress
+            .documents
+            .checked_add(1)
+            .context("too many articles")?;
+        for passage in prepared {
+            let SearchLocation::Article { node, start, end } = passage.entry.location else {
+                anyhow::bail!("article requires an article passage location");
+            };
+            ensure!(
+                passage.entry.resource == self.next_document()
+                    && view.excerpt(node, start, end)? == passage.entry.text,
+                "passage location does not match article text"
+            );
+            batch_len([passage.tokens.len()], omnipotent_embed::MAX_BATCH_SIZE)?;
+            let location = PassageRef::new(passage.entry.resource, node, start, end)?;
+            let key = progress.passages.to_be_bytes();
+            batch.insert(&self.passages, key, location.bytes());
+            let tokens: Vec<_> = passage.tokens.iter().copied().map(U32::new).collect();
+            batch.insert(&self.tokens, key, tokens.as_bytes());
+            progress.passages = progress
+                .passages
+                .checked_add(1)
+                .context("too many passages")?;
+        }
+        self.advance(batch, progress)
     }
-    pub fn embed(&self, encoder: &Encoder, maximum: usize) -> Result<()> {
+
+    pub fn finish_preparation(&mut self) -> Result<()> {
+        ensure!(self.stage() == Stage::Preparing, "not preparing");
+        self.advance(
+            self.batch(),
+            Progress {
+                stage: Stage::Embedding,
+                ..self.progress
+            },
+        )
+    }
+
+    fn store_embeddings(
+        &mut self,
+        rows: impl IntoIterator<Item = (u64, [f32; DIMENSIONS])>,
+    ) -> Result<()> {
+        let mut batch = self.batch();
+        let mut progress = self.progress;
+        for (id, vector) in rows {
+            let key = id.to_be_bytes();
+            ensure!(
+                self.tokens.contains_key(key)? && !self.vectors.contains_key(key)?,
+                "embedding row is not pending"
+            );
+            batch.insert(&self.vectors, key, vector.map(F32::new).as_bytes());
+            batch.remove(&self.tokens, key);
+            progress.embedded += 1;
+        }
+        self.advance(batch, progress)
+    }
+
+    pub fn embed(&mut self, encoder: &Encoder, maximum: usize) -> Result<()> {
         ensure!(
-            self.stage()? == Stage::Embedding,
+            self.stage() == Stage::Embedding,
             "finish preparation before embedding"
         );
         let mut descriptors = Vec::new();
-        {
-            let tx = self.db.begin_read()?;
-            for row in tx.open_table(TOKENS)?.iter()? {
-                let (id, bytes) = row?;
-                ensure!(bytes.value().len() % 4 == 0, "invalid prepared token row");
-                descriptors.push((u32::try_from(bytes.value().len() / 4)?, id.value()));
-            }
+        for row in self.tokens.iter() {
+            let (id, bytes) = row.into_inner()?;
+            ensure!(bytes.len() % 4 == 0, "invalid prepared token row");
+            descriptors.push((
+                u32::try_from(bytes.len() / 4)?,
+                u64::from_be_bytes(id.as_ref().try_into()?),
+            ));
         }
-        eprintln!(
-            "sorting {} descriptors ({} bytes)",
-            descriptors.len(),
-            descriptors.len() * std::mem::size_of::<(u32, u64)>()
-        );
+        eprintln!("sorting {} pending passages", descriptors.len());
         descriptors.sort_unstable();
         let mut cursor = 0;
         while cursor < descriptors.len() {
             let count = batch_len(descriptors[cursor..].iter().map(|d| d.0 as usize), maximum)?;
             let batch = &descriptors[cursor..cursor + count];
-            let rows = {
-                let tx = self.db.begin_read()?;
-                let tokens = tx.open_table(TOKENS)?;
-                batch
-                    .iter()
-                    .map(|(_, id)| {
-                        let bytes = tokens.get(*id)?.context("missing prepared tokens")?;
-                        Ok(bytes
-                            .value()
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|v| u32::from_le_bytes(*v))
-                            .collect())
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            };
+            let rows = batch
+                .iter()
+                .map(|(_, id)| {
+                    let bytes = self
+                        .tokens
+                        .get(id.to_be_bytes())?
+                        .context("missing prepared tokens")?;
+                    Ok(<[U32]>::ref_from_bytes(&bytes)
+                        .map_err(|_| anyhow::anyhow!("invalid token row"))?
+                        .iter()
+                        .map(|token| token.get())
+                        .collect())
+                })
+                .collect::<Result<Vec<_>>>()?;
             let vectors = encoder.embed(&rows)?;
-            let tx = self.db.begin_write()?;
-            {
-                let mut table = tx.open_table(VECTORS)?;
-                let mut tokens = tx.open_table(TOKENS)?;
-                for ((_, id), vector) in batch.iter().zip(vectors) {
-                    table.insert(*id, vector)?;
-                    tokens.remove(*id)?;
-                }
-            }
-            tx.commit()?;
+            ensure!(vectors.len() == count, "unexpected embedding batch size");
+            self.store_embeddings(batch.iter().map(|(_, id)| *id).zip(vectors))?;
             cursor += count;
-            eprintln!("embedded {cursor}/{}", descriptors.len());
+            eprintln!(
+                "embedded {}/{}",
+                self.progress.embedded, self.progress.passages
+            );
         }
         self.finish_embedding()
     }
-    pub fn finish_embedding(&self) -> Result<()> {
-        ensure!(self.stage()? == Stage::Embedding, "not embedding");
-        let tx = self.db.begin_read()?;
+
+    pub fn finish_embedding(&mut self) -> Result<()> {
+        ensure!(self.stage() == Stage::Embedding, "not embedding");
         ensure!(
-            tx.open_table(TOKENS)?.is_empty()?
-                && tx.open_table(PASSAGES)?.len()? == tx.open_table(VECTORS)?.len()?,
+            self.progress.embedded == self.progress.passages && self.tokens.is_empty()?,
             "embedding is incomplete"
         );
-        drop(tx);
-        self.set_stage(Stage::Complete)
+        self.advance(
+            self.batch(),
+            Progress {
+                stage: Stage::Complete,
+                ..self.progress
+            },
+        )
     }
-    /// No source, tokenizer or model is needed here. Raw 768d vectors remain
-    /// available; the search index uses their normalised 256d Matryoshka prefix.
-    pub fn finalize(&mut self) -> Result<()> {
-        ensure!(
-            matches!(self.stage()?, Stage::Complete | Stage::Ready),
-            "ingestion is incomplete"
-        );
-        if self.stage()? == Stage::Ready {
-            return Ok(());
-        }
-        let read = self.db.begin_read()?;
-        let vectors = read.open_table(VECTORS)?;
-        let count = vectors.len()?;
-        let settings = VectorIndex {
-            dimensions: 256,
-            clusters: ((count as f64).sqrt() as u32 / 8).clamp(1, 256),
-            subvectors: 32,
-            retain_raw_for_rerank: true,
-        };
-        if count != 0 {
-            // A bounded, evenly spaced training sample; all vectors are indexed below.
-            let stride = (count / 8192).max(1) as usize;
-            let sample = vectors
-                .iter()?
-                .step_by(stride)
-                .take(8192)
-                .map(|row| {
-                    let (id, v) = row?;
-                    Ok((id.value(), reduce(&v.value())))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let tx = self.db.begin_write()?;
-            {
-                let mut index = tx.open_ivfpq_index(&settings.definition()?)?;
-                index.train(sample.into_iter(), 10)?;
-                for row in vectors.iter()? {
-                    let (id, v) = row?;
-                    index.insert(id.value(), &reduce(&v.value()))?;
-                }
-                index.flush()?;
-            }
-            tx.open_table(META)?
-                .insert("vector_index", serde_json::to_vec(&settings)?.as_slice())?;
-            tx.commit()?;
-        }
-        drop(vectors);
-        drop(read);
-        self.db.compact()?;
-        self.set_stage(Stage::Ready)
+
+    pub fn finalize(&self, out: &Path) -> Result<()> {
+        ensure!(self.stage() == Stage::Complete, "ingestion is incomplete");
+        output::write(self, out)
     }
-}
-fn reduce(vector: &[f32; DIMENSIONS]) -> Vec<f32> {
-    let mut v = vector[..256].to_vec();
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0. {
-        for x in &mut v {
-            *x /= norm;
-        }
-    }
-    v
 }
 
-/// Copy records and raw vectors only. Resource IDs and payload object names are
-/// remapped locally; logical resource identities and article-local anchors stay put.
-pub fn merge(inputs: &[std::path::PathBuf], output: &Path) -> Result<Package> {
+pub fn merge(inputs: &[PathBuf], output: &Path) -> Result<Package> {
     ensure!(!inputs.is_empty(), "merge requires at least one input");
-    let mut output_package = None;
+    let mut target: Option<Package> = None;
     for path in inputs {
-        let source = ReadOnlyDatabase::open(path)?;
-        let read = source.begin_read()?;
-        let reader = PackageReader::open(&read)?;
-        let progress: Progress = serde_json::from_slice(
-            read.open_table(META)?
-                .get("progress")?
-                .context("missing progress")?
-                .value(),
-        )?;
+        let source = Package::open(path)?;
         ensure!(
-            matches!(progress.stage, Stage::Complete | Stage::Ready),
-            "input ingestion is incomplete: {}",
+            source.stage() == Stage::Complete,
+            "merge requires a complete worker: {}",
             path.display()
         );
-        let profile = reader.embedding_profile()?;
-        let package = match &output_package {
-            Some(p) => p,
-            None => output_package.insert(Package::create(output, &profile)?),
+        let target = match target {
+            Some(ref mut target) => target,
+            None => target.insert(Package::create(output, source.profile())?),
         };
         ensure!(
-            package.profile()? == profile,
-            "inputs use different embedding profiles"
+            source.profile() == target.profile(),
+            "embedding profiles differ"
         );
-        let mut remap = std::collections::BTreeMap::new();
-        for row in read.open_table(RESOURCES)?.iter()? {
-            let (id, value) = row?;
-            let resource: Resource = serde_json::from_slice(value.value())?;
-            let new = package.next_document()?;
-            let body = reader.payload(DocumentId(id.value()))?;
-            // Adapt the range reader to std::io::Read without retaining the payload.
-            struct Payload<'a>(shodh_redb::BlobReader<'a>);
-            impl Read for Payload<'_> {
-                fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                    self.0.read_into(bytes).map_err(std::io::Error::other)
-                }
-            }
-            package.add_resource(resource, Payload(body), &[])?;
-            remap.insert(id.value(), new);
+        let document_base = target.progress.documents;
+        for row in source.articles.iter() {
+            let (key, bytes) = row.into_inner()?;
+            let id = u32::from_be_bytes(key.as_ref().try_into()?);
+            ensure!(
+                id == target.progress.documents - document_base,
+                "non-contiguous article keys"
+            );
+            let mut batch = target.batch();
+            target.insert_article(&mut batch, &bytes)?;
+            let documents = target
+                .progress
+                .documents
+                .checked_add(1)
+                .context("too many articles")?;
+            target.advance(
+                batch,
+                Progress {
+                    documents,
+                    ..target.progress
+                },
+            )?;
         }
-        let passages = read.open_table(PASSAGES)?;
-        let vectors = read.open_table(VECTORS)?;
-        ensure!(
-            passages.len()? == vectors.len()?,
-            "input has missing vectors"
-        );
-        let mut rows = passages.iter()?;
+        let mut passages = source.passages.iter();
         loop {
-            let tx = package.db.begin_write()?;
-            let mut copied = 0;
-            {
-                let mut target = tx.open_table(PASSAGES)?;
-                let mut target_vectors = tx.open_table(VECTORS)?;
-                for (next, row) in (target.len()?..).zip(rows.by_ref().take(256)) {
-                    let (id, value) = row?;
-                    let mut entry: SearchEntry = serde_json::from_slice(value.value())?;
-                    entry.resource = *remap
-                        .get(&entry.resource.0)
-                        .context("missing source resource")?;
-                    let vector = vectors
-                        .get(id.value())?
-                        .context("missing source vector")?
-                        .value();
-                    target.insert(next, serde_json::to_vec(&entry)?.as_slice())?;
-                    target_vectors.insert(next, vector)?;
-                    copied += 1;
-                }
+            let mut batch = target.batch();
+            let mut progress = target.progress;
+            for row in passages.by_ref().take(256) {
+                let (key, payload) = row.into_inner()?;
+                let mut passage = *PassageRef::parse(&payload)?;
+                ensure!(
+                    passage.resource().0 < source.progress.documents,
+                    "unknown source document"
+                );
+                passage.remap(DocumentId(document_base + passage.resource().0));
+                let vector = source.vectors.get(&key)?.context("missing source vector")?;
+                let key = progress.passages.to_be_bytes();
+                batch.insert(&target.passages, key, passage.bytes());
+                batch.insert(&target.vectors, key, vector);
+                progress.passages += 1;
+                progress.embedded += 1;
             }
-            if copied == 0 {
+            if progress.passages == target.progress.passages {
                 break;
             }
-            tx.commit()?;
+            target.advance(batch, progress)?;
         }
     }
-    let package = output_package.context("no input packages")?;
-    package.set_stage(Stage::Complete)?;
-    Ok(package)
+    let mut target = target.context("missing merge inputs")?;
+    target.advance(
+        target.batch(),
+        Progress {
+            stage: Stage::Complete,
+            ..target.progress
+        },
+    )?;
+    Ok(target)
 }
